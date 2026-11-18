@@ -3,7 +3,7 @@
 ESP32-S3 on the M200 V4 DEBUG header (UART1, 250000 8N1) that adds a web interface, telnet and BLE to the Zortrax Marlin fork.
 
 - Status and milestones: [docs/newStatus.md](docs/newStatus.md)
-- Structure and decisions: [docs/esps3Plan.md](docs/esps3Plan.md)
+- Structure and decisions: [docs/esps32Plan.md](docs/esps32Plan.md)
 
 ## Layout
 
@@ -19,7 +19,7 @@ ESP32-S3 on the M200 V4 DEBUG header (UART1, 250000 8N1) that adds a web interfa
 
 ## Build
 
-- ESP-IDF version: **TODO: fill in after milestone 1 (pin it, upgrade on purpose)**
+- ESP-IDF version: **v6.1.1** (pinned, upgrade on purpose), installed by EIM at `C:\esp\v6.1.1\esp-idf`
 - Target: `esp32s3`
 - Open `firmware/bridge/` in VS Code with the ESP-IDF extension -> Build, Flash and Monitor.
 

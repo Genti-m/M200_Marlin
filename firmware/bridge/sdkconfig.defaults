@@ -1,0 +1,10 @@
+# Tracked defaults. sdkconfig itself is generated and ignored by git.
+CONFIG_IDF_TARGET="esp32s3"
+
+# Most ESP32-S3 DevKitC-1 boards have 8 MB flash or more; 4 MB is the safe minimum.
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+
+# Logs go to UART0 ("UART" USB port) and also to USB Serial/JTAG ("USB" port),
+# so the monitor works on either port.
+CONFIG_ESP_CONSOLE_UART_DEFAULT=y
+CONFIG_ESP_CONSOLE_SECONDARY_USB_SERIAL_JTAG=y

@@ -1,0 +1,22 @@
+# ESP-IDF build output
+build/
+managed_components/
+dependencies.lock
+sdkconfig
+sdkconfig.old
+# keep sdkconfig.defaults (tracked)
+
+# secrets (WiFi password, API token) - never commit
+secrets.*
+*.secret
+firmware/**/main/secrets.h
+
+# editors / OS
+.vscode/*
+!.vscode/extensions.json
+.DS_Store
+Thumbs.db
+
+# Python tools
+__pycache__/
+.venv/
