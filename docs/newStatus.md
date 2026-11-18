@@ -64,7 +64,7 @@ m200_bridge/
 |---|------|-----------|
 | 0 | Find TX/RX/GND | **done** (DEBUG 3/4/7, 250000) |
 | 1 | ESP-IDF setup | **done** 2026-11-18 (IDF v6.1.1, flashed over native USB COM7, heartbeat on monitor) |
-| 2 | UART bridge | typed `M115` in the monitor -> Marlin answers `FIRMWARE_NAME... ok` |
+| 2 | UART bridge | **done** 2026-11-18 (`M115` answered both ways, caps in `marlin_caps.md`) |
 | 3 | WiFi + mDNS | `ping m200.local` works, credentials stored in NVS |
 | 4 | **Web interface** | `http://m200.local`: temps, Home / Motors off / Preheat / STOP buttons, live console |
 | 5 | Telnet + BLE | `telnet m200.local 23` and nRF Connect both send `M105` and see the reply |
@@ -72,7 +72,8 @@ m200_bridge/
 | 7 | Install | buck converter, case inside the base, access token on the web API |
 
 ## Open points (small)
-- `Hardcoded Default Settings Loaded` at boot: try `M500` after milestone 2 to see if this build can save settings.
+- ~~`Hardcoded Default Settings Loaded`: try `M500`~~ -> `Cap:EEPROM:0`, this build can't save settings (see `marlin_caps.md`).
+- `Cap:EMERGENCY_PARSER:0`: STOP (`M112`) only runs after the current command. Check during a `G28` whether `busy:` lines appear (sets the `ok` timeout).
 - Pick the buck converter after measuring the PSU voltage (24 V expected).
 - The web page and telnet have no password at first: home network only, add a token in milestone 7.
 

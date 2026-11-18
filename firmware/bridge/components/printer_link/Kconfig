@@ -1,0 +1,31 @@
+menu "Printer link (Marlin UART)"
+
+    config PRINTER_LINK_UART_NUM
+        int "UART port number"
+        range 1 2
+        default 1
+
+    config PRINTER_LINK_TX_GPIO
+        int "ESP TX GPIO (to printer RX, DEBUG pin 4)"
+        default 17
+
+    config PRINTER_LINK_RX_GPIO
+        int "ESP RX GPIO (from printer TX, DEBUG pin 3)"
+        default 18
+
+    config PRINTER_LINK_BAUD
+        int "Baud rate"
+        default 250000
+
+    config PRINTER_LINK_OK_TIMEOUT_MS
+        int "Wait for 'ok' timeout (ms)"
+        default 15000
+        help
+            How long one command may go without an "ok". A "busy:" line from Marlin restarts
+            the wait. After the timeout the link is marked NO_REPLY and the next command is sent.
+
+    config PRINTER_LINK_QUEUE_LEN
+        int "Command queue length"
+        default 16
+
+endmenu

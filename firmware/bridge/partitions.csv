@@ -1,0 +1,8 @@
+# 8 MB flash: two OTA slots from day one (changing this later means erasing flash).
+# Name,    Type, SubType,  Offset, Size
+nvs,       data, nvs,      ,       0x6000
+otadata,   data, ota,      ,       0x2000
+phy_init,  data, phy,      ,       0x1000
+ota_0,     app,  ota_0,    ,       3M
+ota_1,     app,  ota_1,    ,       3M
+storage,   data, littlefs, ,       0x1D0000

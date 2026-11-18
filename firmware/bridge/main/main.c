@@ -1,38 +1,20 @@
-// Milestone 1: prove the toolchain, flashing and monitor work.
-// Prints chip info once, then a heartbeat every second.
+// Start-up only: create the shared services, then the features. No feature logic here.
 
-#include <inttypes.h>
-#include <stdio.h>
-
-#include "esp_chip_info.h"
-#include "esp_flash.h"
-#include "esp_idf_version.h"
+#include "console_bridge.h"
+#include "esp_app_desc.h"
+#include "esp_event.h"
 #include "esp_log.h"
-#include "esp_system.h"
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
+#include "printer_link.h"
 
 static const char *TAG = "m200_bridge";
 
 void app_main(void)
 {
-    esp_chip_info_t chip;
-    esp_chip_info(&chip);
+    const esp_app_desc_t *app = esp_app_get_description();
+    ESP_LOGI(TAG, "%s %s (ESP-IDF %s, built %s %s)", app->project_name, app->version,
+             app->idf_ver, app->date, app->time);
 
-    uint32_t flash_size = 0;
-    esp_flash_get_size(NULL, &flash_size);
-
-    ESP_LOGI(TAG, "M200 bridge, hello world");
-    ESP_LOGI(TAG, "ESP-IDF %s", esp_get_idf_version());
-    ESP_LOGI(TAG, "%s rev v%d.%d, %d cores, WiFi%s%s, %" PRIu32 " MB flash",
-             CONFIG_IDF_TARGET, chip.revision / 100, chip.revision % 100, chip.cores,
-             (chip.features & CHIP_FEATURE_BT) ? "/BT" : "",
-             (chip.features & CHIP_FEATURE_BLE) ? "/BLE" : "",
-             flash_size / (1024 * 1024));
-    ESP_LOGI(TAG, "free heap: %" PRIu32 " bytes", esp_get_free_heap_size());
-
-    for (uint32_t n = 0;; n++) {
-        ESP_LOGI(TAG, "alive %" PRIu32, n);
-        vTaskDelay(pdMS_TO_TICKS(1000));
-    }
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+    ESP_ERROR_CHECK(printer_link_start());
+    ESP_ERROR_CHECK(console_bridge_start());  // temporary, milestone 2
 }
