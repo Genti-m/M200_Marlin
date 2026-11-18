@@ -11,3 +11,9 @@ CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 # The board is used through its native USB port (USB Serial/JTAG, COM7).
 # Primary console there, so the monitor can also send input (temporary G-code console).
 CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+
+# Milestone 3/4: WiFi, web server
+CONFIG_HTTPD_WS_SUPPORT=y
+# The web/state handlers run in the default event loop task: more stack and a longer queue
+CONFIG_ESP_SYSTEM_EVENT_TASK_STACK_SIZE=4096
+CONFIG_ESP_SYSTEM_EVENT_QUEUE_SIZE=64

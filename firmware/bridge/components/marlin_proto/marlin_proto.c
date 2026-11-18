@@ -84,7 +84,8 @@ marlin_line_type_t marlin_parse_line(const char *line, marlin_reply_t *out)
     if (strcmp(s, "ok") == 0 || starts_with(s, "ok ")) {
         r.type = MARLIN_LINE_OK;
         marlin_parse_temps(s, &r.nozzle, &r.bed);  // M105 answer: "ok T:..."
-    } else if (starts_with(s, "busy:")) {
+    } else if (starts_with(s, "busy:") || starts_with(s, "echo:busy:")) {
+        // Marlin 2.x host keepalive prints "echo:busy: processing"
         r.type = MARLIN_LINE_BUSY;
     } else if (starts_with_nocase(s, "Error:") || starts_with(s, "!!")) {
         r.type = MARLIN_LINE_ERROR;

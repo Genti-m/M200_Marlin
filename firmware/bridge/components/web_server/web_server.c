@@ -1,0 +1,557 @@
+#include "web_server.h"
+
+#include <ctype.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "esp_app_desc.h"
+#include "esp_http_server.h"
+#include "esp_log.h"
+#include "esp_ota_ops.h"
+#include "esp_system.h"
+#include "esp_timer.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "json_util.h"
+#include "printer_link.h"
+#include "printer_state.h"
+#include "wifi_link.h"
+
+static const char *TAG = "web_server";
+
+#define MAX_CLIENTS       7       // httpd max_open_sockets
+#define MAX_WS_FRAME      2048
+#define MAX_GCODE_BODY    4096
+#define MAX_LINES_PER_MSG 32
+#define USER_LINE_MAX     96      // docs/protocol.md
+#define STATE_PERIOD_US   (5 * 1000 * 1000)
+
+static httpd_handle_t s_server;
+
+// ---------------------------------------------------------------- embedded UI
+
+#define ASSET(sym) \
+    extern const uint8_t sym##_start[] asm("_binary_" #sym "_start"); \
+    extern const uint8_t sym##_end[] asm("_binary_" #sym "_end")
+ASSET(index_html_gz);
+ASSET(style_css_gz);
+ASSET(app_js_gz);
+
+typedef struct {
+    const uint8_t *start;
+    const uint8_t *end;
+    const char *type;
+} asset_t;
+
+static const asset_t s_index = {index_html_gz_start, index_html_gz_end, "text/html; charset=utf-8"};
+static const asset_t s_css = {style_css_gz_start, style_css_gz_end, "text/css"};
+static const asset_t s_js = {app_js_gz_start, app_js_gz_end, "application/javascript"};
+
+static esp_err_t asset_get(httpd_req_t *req)
+{
+    const asset_t *a = req->user_ctx;
+    httpd_resp_set_type(req, a->type);
+    httpd_resp_set_hdr(req, "Content-Encoding", "gzip");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-cache");
+    return httpd_resp_send(req, (const char *)a->start, a->end - a->start);
+}
+
+// ---------------------------------------------------------------- JSON builders
+
+static const char *link_name(printer_link_state_t s)
+{
+    return s == PRINTER_LINK_UP ? "up" : s == PRINTER_LINK_NO_REPLY ? "no_reply" : "unknown";
+}
+
+static void jb_temp(jbuf_t *b, const marlin_temp_t *t)
+{
+    if (t->valid) {
+        jb_printf(b, "[%.1f,%.0f]", (double)t->actual, (double)t->target);
+    } else {
+        jb_puts(b, "null");
+    }
+}
+
+static void jb_state(jbuf_t *b, bool with_type)
+{
+    printer_state_t s;
+    printer_state_get(&s);
+    jb_puts(b, with_type ? "{\"t\":\"state\"," : "{");
+    jb_printf(b, "\"link\":\"%s\",\"nozzle\":", link_name(s.link));
+    jb_temp(b, &s.nozzle);
+    jb_puts(b, ",\"bed\":");
+    jb_temp(b, &s.bed);
+    jb_printf(b, ",\"busy\":%s,\"homed\":%s,\"pos\":", s.busy ? "true" : "false",
+              s.homed ? "true" : "false");
+    if (s.pos_valid) {
+        jb_printf(b, "[%.2f,%.2f,%.2f]", (double)s.pos[0], (double)s.pos[1], (double)s.pos[2]);
+    } else {
+        jb_puts(b, "null");
+    }
+    int rssi = wifi_link_rssi();
+    if (rssi) {
+        jb_printf(b, ",\"rssi\":%d", rssi);
+    } else {
+        jb_puts(b, ",\"rssi\":null");
+    }
+    jb_printf(b, ",\"queue\":%u}", (unsigned)s.queue);
+}
+
+static void jb_line(jbuf_t *b, bool tx, printer_source_t src, const char *text)
+{
+    jb_puts(b, tx ? "{\"t\":\"line\",\"dir\":\"tx\",\"src\":\"" : "{\"t\":\"line\",\"dir\":\"rx\"");
+    if (tx) {
+        jb_puts(b, printer_source_name(src));
+        jb_puts(b, "\"");
+    }
+    jb_puts(b, ",\"text\":");
+    jb_str(b, text);
+    jb_puts(b, "}");
+}
+
+static void jb_temp_sample(jbuf_t *b, int16_t v)
+{
+    if (v == INT16_MIN) {
+        jb_puts(b, "null");
+    } else {
+        jb_printf(b, "%.1f", v / 10.0);
+    }
+}
+
+// The big hello message: history of lines and temps. Built in the httpd task.
+static bool build_hello(jbuf_t *b)
+{
+    printer_hist_line_t *lines = malloc(sizeof(*lines) * PRINTER_STATE_LINES);
+    printer_temp_sample_t *temps = malloc(sizeof(*temps) * PRINTER_STATE_TEMPS);
+    if (!lines || !temps) {
+        free(lines);
+        free(temps);
+        return false;
+    }
+    size_t nl = printer_state_copy_lines(lines, PRINTER_STATE_LINES);
+    size_t nt = printer_state_copy_temps(temps, PRINTER_STATE_TEMPS);
+
+    jb_puts(b, "{\"t\":\"hello\",\"name\":");
+    jb_str(b, wifi_link_hostname());
+    jb_puts(b, ",\"fw\":");
+    jb_str(b, esp_app_get_description()->version);
+    jb_puts(b, ",\"history\":[");
+    for (size_t i = 0; i < nl; i++) {
+        if (i) {
+            jb_puts(b, ",");
+        }
+        jb_line(b, lines[i].tx, lines[i].source, lines[i].text);
+    }
+    jb_puts(b, "],\"temps\":[");
+    int64_t now = esp_timer_get_time();
+    bool first = true;
+    for (size_t i = 0; i < nt; i++) {
+        const printer_temp_sample_t *t = &temps[i];
+        if (t->nozzle_x10 == INT16_MIN && t->bed_x10 == INT16_MIN) {
+            continue;
+        }
+        jb_printf(b, "%s[%.1f,", first ? "" : ",", (double)(now - t->time_us) / 1e6);
+        first = false;
+        jb_temp_sample(b, t->nozzle_x10);
+        jb_puts(b, ",");
+        jb_temp_sample(b, t->nozzle_target_x10);
+        jb_puts(b, ",");
+        jb_temp_sample(b, t->bed_x10);
+        jb_puts(b, ",");
+        jb_temp_sample(b, t->bed_target_x10);
+        jb_puts(b, "]");
+    }
+    jb_puts(b, "]}");
+    free(lines);
+    free(temps);
+    return !b->oom;
+}
+
+// ---------------------------------------------------------------- WebSocket send (httpd task)
+
+typedef struct {
+    int fd;          // -1: all WebSocket clients
+    size_t len;
+    char data[];
+} ws_msg_t;
+
+static void ws_send_fd(int fd, const char *data, size_t len)
+{
+    if (httpd_ws_get_fd_info(s_server, fd) != HTTPD_WS_CLIENT_WEBSOCKET) {
+        return;
+    }
+    httpd_ws_frame_t f = {
+        .final = true,
+        .type = HTTPD_WS_TYPE_TEXT,
+        .payload = (uint8_t *)data,
+        .len = len,
+    };
+    if (httpd_ws_send_frame_async(s_server, fd, &f) != ESP_OK) {
+        ESP_LOGD(TAG, "send to fd %d failed", fd);
+    }
+}
+
+static void ws_send_work(void *arg)
+{
+    ws_msg_t *m = arg;
+    if (m->fd >= 0) {
+        ws_send_fd(m->fd, m->data, m->len);
+    } else {
+        size_t n = MAX_CLIENTS;
+        int fds[MAX_CLIENTS];
+        if (httpd_get_client_list(s_server, &n, fds) == ESP_OK) {
+            for (size_t i = 0; i < n; i++) {
+                ws_send_fd(fds[i], m->data, m->len);
+            }
+        }
+    }
+    free(m);
+}
+
+// Hand a built message to the httpd task. Frees the buffer.
+static void ws_queue(jbuf_t *b, int fd)
+{
+    if (s_server && !b->oom && b->len) {
+        ws_msg_t *m = malloc(sizeof(*m) + b->len);
+        if (m) {
+            m->fd = fd;
+            m->len = b->len;
+            memcpy(m->data, b->buf, b->len);
+            if (httpd_queue_work(s_server, ws_send_work, m) != ESP_OK) {
+                free(m);
+            }
+        }
+    }
+    jb_free(b);
+}
+
+static void hello_work(void *arg)
+{
+    int fd = (int)(intptr_t)arg;
+    jbuf_t b;
+    jb_init(&b, 8192);
+    if (build_hello(&b)) {
+        ws_send_fd(fd, b.buf, b.len);
+    } else {
+        ESP_LOGW(TAG, "no memory for hello");
+    }
+    jb_free(&b);
+    jb_init(&b, 256);
+    jb_state(&b, true);
+    if (!b.oom) {
+        ws_send_fd(fd, b.buf, b.len);
+    }
+    jb_free(&b);
+}
+
+// ---------------------------------------------------------------- commands from clients
+
+static bool submit_line(const char *raw)
+{
+    char line[USER_LINE_MAX + 1];
+    while (*raw == ' ' || *raw == '\t') {
+        raw++;
+    }
+    size_t n = strcspn(raw, "\r\n");
+    while (n > 0 && (raw[n - 1] == ' ' || raw[n - 1] == '\t')) {
+        n--;
+    }
+    if (n == 0) {
+        return false;
+    }
+    if (n > USER_LINE_MAX) {
+        ESP_LOGW(TAG, "line too long (%u chars), dropped", (unsigned)n);
+        return false;
+    }
+    memcpy(line, raw, n);
+    line[n] = '\0';
+    if (printer_is_emergency_command(line)) {
+        return printer_emergency(line, PRINTER_SRC_WEB) == ESP_OK;
+    }
+    if (printer_send(line, PRINTER_SRC_WEB, pdMS_TO_TICKS(200)) != ESP_OK) {
+        ESP_LOGW(TAG, "printer queue full, dropped: %s", line);
+        return false;
+    }
+    return true;
+}
+
+static void handle_client_json(const char *js)
+{
+    char type[16];
+    const char *v = jin_find(js, "t");
+    if (!v || !jin_string(v, type, sizeof(type))) {
+        return;
+    }
+    if (strcmp(type, "stop") == 0) {
+        printer_emergency("M112", PRINTER_SRC_WEB);
+    } else if (strcmp(type, "gcode") == 0) {
+        const char *p = jin_find(js, "lines");
+        if (!p || *p != '[') {
+            return;
+        }
+        p = jin_ws(p + 1);
+        char line[PRINTER_LINE_MAX];
+        for (int i = 0; i < MAX_LINES_PER_MSG && *p == '"'; i++) {
+            p = jin_string(p, line, sizeof(line));
+            if (!p) {
+                return;
+            }
+            submit_line(line);
+            p = jin_ws(p);
+            if (*p != ',') {
+                break;
+            }
+            p = jin_ws(p + 1);
+        }
+    }
+}
+
+static esp_err_t ws_handler(httpd_req_t *req)
+{
+    if (req->method == HTTP_GET) {  // handshake done
+        int fd = httpd_req_to_sockfd(req);
+        ESP_LOGI(TAG, "WebSocket client fd %d", fd);
+        httpd_queue_work(s_server, hello_work, (void *)(intptr_t)fd);
+        return ESP_OK;
+    }
+    httpd_ws_frame_t f = {.type = HTTPD_WS_TYPE_TEXT};
+    esp_err_t err = httpd_ws_recv_frame(req, &f, 0);  // length only
+    if (err != ESP_OK) {
+        return err;
+    }
+    if (f.len > MAX_WS_FRAME) {
+        ESP_LOGW(TAG, "frame of %u bytes too big", (unsigned)f.len);
+        return ESP_FAIL;  // closes the connection
+    }
+    char *buf = malloc(f.len + 1);
+    if (!buf) {
+        return ESP_ERR_NO_MEM;
+    }
+    f.payload = (uint8_t *)buf;
+    err = httpd_ws_recv_frame(req, &f, f.len);
+    if (err == ESP_OK && f.type == HTTPD_WS_TYPE_TEXT) {
+        buf[f.len] = '\0';
+        handle_client_json(buf);
+    }
+    free(buf);
+    return err;
+}
+
+// ---------------------------------------------------------------- REST
+
+static esp_err_t send_json(httpd_req_t *req, const char *json)
+{
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    return httpd_resp_sendstr(req, json);
+}
+
+static esp_err_t api_state_get(httpd_req_t *req)
+{
+    jbuf_t b;
+    jb_init(&b, 256);
+    jb_state(&b, false);
+    esp_err_t err = b.oom ? httpd_resp_send_500(req) : send_json(req, b.buf);
+    jb_free(&b);
+    return err;
+}
+
+// Read the whole body (up to max) into a new buffer. NULL + response sent on error.
+static char *read_body(httpd_req_t *req, size_t max)
+{
+    if (req->content_len > max) {
+        httpd_resp_send_err(req, HTTPD_413_CONTENT_TOO_LARGE, "body too large");
+        return NULL;
+    }
+    char *buf = malloc(req->content_len + 1);
+    if (!buf) {
+        httpd_resp_send_500(req);
+        return NULL;
+    }
+    size_t got = 0;
+    while (got < req->content_len) {
+        int r = httpd_req_recv(req, buf + got, req->content_len - got);
+        if (r == HTTPD_SOCK_ERR_TIMEOUT) {
+            continue;
+        }
+        if (r <= 0) {
+            free(buf);
+            return NULL;
+        }
+        got += (size_t)r;
+    }
+    buf[got] = '\0';
+    return buf;
+}
+
+static esp_err_t api_gcode_post(httpd_req_t *req)
+{
+    char *body = read_body(req, MAX_GCODE_BODY);
+    if (!body) {
+        return ESP_FAIL;
+    }
+    int queued = 0;
+    char *save = NULL;
+    for (char *l = strtok_r(body, "\n", &save); l; l = strtok_r(NULL, "\n", &save)) {
+        queued += submit_line(l);
+    }
+    free(body);
+    char out[32];
+    snprintf(out, sizeof(out), "{\"queued\":%d}", queued);
+    return send_json(req, out);
+}
+
+static esp_err_t api_stop_post(httpd_req_t *req)
+{
+    printer_emergency("M112", PRINTER_SRC_WEB);
+    return send_json(req, "{\"ok\":true}");
+}
+
+static void restart_task(void *arg)
+{
+    vTaskDelay(pdMS_TO_TICKS(500));
+    esp_restart();
+}
+
+// POST /api/ota with the raw app image (build/m200_bridge.bin) as body.
+static esp_err_t api_ota_post(httpd_req_t *req)
+{
+    const esp_partition_t *part = esp_ota_get_next_update_partition(NULL);
+    if (!part) {
+        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "no OTA partition");
+    }
+    if (req->content_len == 0 || req->content_len > part->size) {
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad image size");
+    }
+    ESP_LOGW(TAG, "OTA: %u bytes -> %s", (unsigned)req->content_len, part->label);
+
+    esp_ota_handle_t ota;
+    esp_err_t err = esp_ota_begin(part, OTA_WITH_SEQUENTIAL_WRITES, &ota);
+    if (err != ESP_OK) {
+        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, esp_err_to_name(err));
+    }
+    char *buf = malloc(4096);
+    if (!buf) {
+        esp_ota_abort(ota);
+        return httpd_resp_send_500(req);
+    }
+    size_t left = req->content_len;
+    while (left > 0 && err == ESP_OK) {
+        int r = httpd_req_recv(req, buf, left < 4096 ? left : 4096);
+        if (r == HTTPD_SOCK_ERR_TIMEOUT) {
+            continue;
+        }
+        if (r <= 0) {
+            err = ESP_FAIL;
+            break;
+        }
+        err = esp_ota_write(ota, buf, (size_t)r);
+        left -= (size_t)r;
+    }
+    free(buf);
+    if (err != ESP_OK) {
+        esp_ota_abort(ota);
+        ESP_LOGE(TAG, "OTA failed: %s", esp_err_to_name(err));
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, esp_err_to_name(err));
+    }
+    err = esp_ota_end(ota);  // checks the image
+    if (err == ESP_OK) {
+        err = esp_ota_set_boot_partition(part);
+    }
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "OTA image rejected: %s", esp_err_to_name(err));
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, esp_err_to_name(err));
+    }
+    ESP_LOGW(TAG, "OTA done, rebooting into %s", part->label);
+    send_json(req, "{\"ok\":true,\"rebooting\":true}");
+    xTaskCreate(restart_task, "restart", 2048, NULL, 5, NULL);
+    return ESP_OK;
+}
+
+// ---------------------------------------------------------------- printer events -> clients
+
+static void on_printer_event(void *arg, esp_event_base_t base, int32_t id, void *data)
+{
+    jbuf_t b;
+    if (id == PRINTER_EVENT_RX_LINE) {
+        const printer_rx_event_t *ev = data;
+        jb_init(&b, 192);
+        jb_line(&b, false, PRINTER_SRC_INTERNAL, ev->text);
+    } else if (id == PRINTER_EVENT_TX_LINE) {
+        const printer_tx_event_t *ev = data;
+        jb_init(&b, 192);
+        jb_line(&b, true, ev->source, ev->text);
+    } else {
+        return;
+    }
+    ws_queue(&b, -1);
+}
+
+static void broadcast_state(void)
+{
+    jbuf_t b;
+    jb_init(&b, 256);
+    jb_state(&b, true);
+    ws_queue(&b, -1);
+}
+
+static void on_state_event(void *arg, esp_event_base_t base, int32_t id, void *data)
+{
+    broadcast_state();
+}
+
+// Also when the printer is off (no temp reports): keeps the dots and RSSI fresh.
+static void state_timer_cb(void *arg)
+{
+    broadcast_state();
+}
+
+// ---------------------------------------------------------------- start
+
+esp_err_t web_server_start(void)
+{
+    if (s_server) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
+    cfg.max_uri_handlers = 12;
+    cfg.max_open_sockets = MAX_CLIENTS;
+    cfg.lru_purge_enable = true;
+    cfg.stack_size = 8192;
+    cfg.send_wait_timeout = 3;
+
+    esp_err_t err = httpd_start(&s_server, &cfg);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "httpd_start: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    const httpd_uri_t uris[] = {
+        {.uri = "/", .method = HTTP_GET, .handler = asset_get, .user_ctx = (void *)&s_index},
+        {.uri = "/index.html", .method = HTTP_GET, .handler = asset_get, .user_ctx = (void *)&s_index},
+        {.uri = "/style.css", .method = HTTP_GET, .handler = asset_get, .user_ctx = (void *)&s_css},
+        {.uri = "/app.js", .method = HTTP_GET, .handler = asset_get, .user_ctx = (void *)&s_js},
+        {.uri = "/ws", .method = HTTP_GET, .handler = ws_handler, .is_websocket = true},
+        {.uri = "/api/state", .method = HTTP_GET, .handler = api_state_get},
+        {.uri = "/api/gcode", .method = HTTP_POST, .handler = api_gcode_post},
+        {.uri = "/api/stop", .method = HTTP_POST, .handler = api_stop_post},
+        {.uri = "/api/ota", .method = HTTP_POST, .handler = api_ota_post},
+    };
+    for (size_t i = 0; i < sizeof(uris) / sizeof(uris[0]); i++) {
+        ESP_ERROR_CHECK(httpd_register_uri_handler(s_server, &uris[i]));
+    }
+
+    ESP_ERROR_CHECK(esp_event_handler_register(PRINTER_EVENT, ESP_EVENT_ANY_ID, on_printer_event, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_register(PRINTER_STATE_EVENT, PRINTER_STATE_EVENT_CHANGED,
+                                               on_state_event, NULL));
+    const esp_timer_create_args_t targs = {.callback = state_timer_cb, .name = "web_state"};
+    esp_timer_handle_t timer;
+    ESP_ERROR_CHECK(esp_timer_create(&targs, &timer));
+    ESP_ERROR_CHECK(esp_timer_start_periodic(timer, STATE_PERIOD_US));
+
+    ESP_LOGI(TAG, "HTTP server on port %d (UI %u+%u+%u bytes gzipped)", cfg.server_port,
+             (unsigned)(index_html_gz_end - index_html_gz_start),
+             (unsigned)(style_css_gz_end - style_css_gz_start),
+             (unsigned)(app_js_gz_end - app_js_gz_start));
+    return ESP_OK;
+}

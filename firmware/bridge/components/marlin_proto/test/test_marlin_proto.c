@@ -39,7 +39,9 @@ int main(void)
     CHECK(marlin_parse_line("Resend: 12", &r) == MARLIN_LINE_RESEND && r.resend_line == 12);
     CHECK(marlin_parse_line("Resend:N7", &r) == MARLIN_LINE_RESEND && r.resend_line == 7);
     CHECK(marlin_parse_line("rs 5", &r) == MARLIN_LINE_RESEND && r.resend_line == 5);
-    CHECK(marlin_parse_line("echo:busy: processing", &r) == MARLIN_LINE_ECHO);
+    CHECK(marlin_parse_line("echo:busy: processing", &r) == MARLIN_LINE_BUSY);
+    CHECK(marlin_parse_line("echo:busy: paused for user", &r) == MARLIN_LINE_BUSY);
+    CHECK(marlin_parse_line("echo:Unknown command: \"FOO\"", &r) == MARLIN_LINE_ECHO);
     CHECK(marlin_parse_line("start", &r) == MARLIN_LINE_START);
     CHECK(marlin_parse_line("FIRMWARE_NAME:Marlin bugfix-2.1.x", &r) == MARLIN_LINE_OTHER);
     CHECK(marlin_parse_line("Cap:EMERGENCY_PARSER:1", &r) == MARLIN_LINE_OTHER);

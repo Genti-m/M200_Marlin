@@ -66,6 +66,9 @@ bool printer_is_emergency_command(const char *line);
 
 printer_link_state_t printer_link_get_state(void);
 
+// Lines waiting in the queue (not counting the one in flight).
+uint32_t printer_link_queue_len(void);
+
 const char *printer_link_state_name(printer_link_state_t state);
 
 #ifdef __cplusplus
