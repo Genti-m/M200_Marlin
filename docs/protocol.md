@@ -49,7 +49,7 @@ Example:
 | `auth` | `token` | log this connection in (see Authentication). Answer: an `auth` message |
 | `stop` | none | `printer_state_soft_stop()`: queue cleared, `M410` sent at once, then `M104 S0`, `M140 S0`, `M107`, `M84`, `G90`, `M121`. Aborts a running home. Marlin keeps running (no `kill()`, no power-cycle). Without `EMERGENCY_PARSER` Marlin runs `M410` only after the current command. Sets `stopped` |
 | `restart` | none | clears `stopped`. Home again before moving |
-| `home_xy` | none | `printer_state_home_xy()`: X then Y fast to the min endstop (`M120`), back off, slow in, `M119` must show it pressed; `G92 X0 Y0`, park at X/Y `park` |
+| `home_xy` | none | `printer_state_home_xy()`: X then Y in 1 mm steps toward the min endstop with `M119` after each (Marlin doesn't stop a plain move on these switches), back off, 0.1 mm steps; `G92 X0 Y0`, park at X/Y `park` |
 | `home_z` | none | `printer_state_home_z()`: steps toward the switch on the probe line (`z_dir`, `z_fast_step`) with `M119` after each, back off, fine steps (`z_slow_step`); `G92 Z0`, park `park` mm away from the switch |
 | `settings_set` | any setting keys with numbers, e.g. `{"t":"settings_set","max_x":180}` | keys left out keep their value. Checked, applied and saved in NVS, then a `settings` message to every client. Refused while homing or when out of range / inconsistent (an `Error:bridge: setting ...` line says why, nothing changes) |
 
