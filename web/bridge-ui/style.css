@@ -106,7 +106,10 @@ h2 .ic { width: 16px; height: 16px; margin-right: -2px; }
 .icon-btn:hover:not(:disabled) { color: var(--text); background: var(--btn); }
 .icon-btn .ic { width: 16px; height: 16px; }
 /* Live position: an XY frame like the presets, plus a Z gauge. Dot = last M114. */
-.live { display: flex; gap: 8px; max-width: 340px; margin: 0 auto 10px; }  /* not huge on phones */
+.live { display: flex; gap: 8px; max-width: 340px; margin: 0 auto 10px; --pad: 14px; }  /* not huge on phones */
+/* 0..max maps inside this, the same margin on all four sides (dot at 0 and at max alike) */
+.live-area { position: absolute; inset: var(--pad); }
+.live-z .live-area { inset: var(--pad) 0; }
 .live-xy { flex: 1; aspect-ratio: 1; cursor: default; }
 .live .live-xy .dot-at {  /* beats ".frame .dot-at" (presets) further down */
   background: var(--ok); box-shadow: 0 0 0 4px color-mix(in srgb, var(--ok) 25%, transparent);

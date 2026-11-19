@@ -399,6 +399,21 @@ static void ws_login(httpd_req_t *req, const char *js)
     ws_send_auth(httpd_req_to_sockfd(req), ok);
 }
 
+// A batch (a jog: M120 G91 G1 G90 M400 M121 M114) must go into the printer queue whole. Half
+// of one (G91 without its G90) would leave Marlin relative, and a dropped line makes the bridge
+// forget the homes. So a batch that doesn't fit is refused before any line is queued: the
+// click does nothing and the homes stay.
+static bool batch_fits(int count)
+{
+    if ((uint32_t)count <= printer_link_queue_free()) {
+        return true;
+    }
+    ESP_LOGW(TAG, "batch of %d lines refused, %u free in the queue", count,
+             (unsigned)printer_link_queue_free());
+    printer_state_note("Error:bridge: busy, the last moves are still queued: try again when they finish");
+    return false;
+}
+
 static void handle_client_json(httpd_req_t *req, const char *js)
 {
     char type[16];
@@ -427,25 +442,35 @@ static void handle_client_json(httpd_req_t *req, const char *js)
     } else if (strcmp(type, "settings_set") == 0) {
         apply_settings(js);  // the answer is a "settings" message, or an Error:bridge: line
     } else if (strcmp(type, "gcode") == 0) {
-        const char *p = jin_find(js, "lines");
-        if (!p || *p != '[') {
+        const char *start = jin_find(js, "lines");
+        if (!start || *start != '[') {
             return;
         }
-        p = jin_ws(p + 1);
+        start = jin_ws(start + 1);
         char line[PRINTER_LINE_MAX];
-        for (int i = 0; i < MAX_LINES_PER_MSG && *p == '"'; i++) {
-            p = jin_string(p, line, sizeof(line));
-            if (!p) {
+        // Pass 0 counts the lines, pass 1 sends them: a batch goes in whole or not at all.
+        int count = 0;
+        for (int pass = 0; pass < 2; pass++) {
+            const char *p = start;
+            for (int i = 0; i < MAX_LINES_PER_MSG && *p == '"'; i++) {
+                p = jin_string(p, line, sizeof(line));
+                if (!p) {
+                    return;
+                }
+                if (pass == 0) {
+                    count++;
+                } else if (submit_line(line) < 0) {
+                    return;
+                }
+                p = jin_ws(p);
+                if (*p != ',') {
+                    break;
+                }
+                p = jin_ws(p + 1);
+            }
+            if (pass == 0 && !batch_fits(count)) {
                 return;
             }
-            if (submit_line(line) < 0) {
-                return;
-            }
-            p = jin_ws(p);
-            if (*p != ',') {
-                break;
-            }
-            p = jin_ws(p + 1);
         }
     }
 }
@@ -616,6 +641,20 @@ static esp_err_t api_gcode_post(httpd_req_t *req)
     char *body = read_body(req, MAX_GCODE_BODY);
     if (!body) {
         return ESP_FAIL;
+    }
+    int lines = 0;  // non-blank lines, for the whole-batch check
+    for (const char *p = body; *p;) {
+        const char *nl = strchr(p, '\n');
+        size_t n = nl ? (size_t)(nl - p) : strlen(p);
+        if (strspn(p, " \t\r") < n) {
+            lines++;
+        }
+        p += n + (nl ? 1 : 0);
+    }
+    if (!batch_fits(lines)) {
+        free(body);
+        httpd_resp_set_status(req, "503 Service Unavailable");
+        return send_json(req, "{\"queued\":0,\"error\":\"busy: printer queue full, nothing sent\"}");
     }
     int queued = 0;
     char *save = NULL;

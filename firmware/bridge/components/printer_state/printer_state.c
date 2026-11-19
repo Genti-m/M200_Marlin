@@ -477,6 +477,11 @@ bool printer_state_allow(const char *line, printer_source_t source)
     return why == NULL;
 }
 
+void printer_state_note(const char *text)
+{
+    post_note(text);
+}
+
 void printer_state_dropped(const char *line)
 {
     xSemaphoreTake(s_mux, portMAX_DELAY);

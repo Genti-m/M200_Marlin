@@ -114,6 +114,10 @@ bool printer_state_allow(const char *line, printer_source_t source);
 // homes are dropped (positions and G90/G91 no longer known) and an "Error:bridge:" line says so.
 void printer_state_dropped(const char *line);
 
+// Show a bridge line ("echo:bridge: ..." / "Error:bridge: ...") to every client. The text
+// must not contain "kill" or "halted" (it would read as a Marlin kill).
+void printer_state_note(const char *text);
+
 // Homing without G28 (it preheats for the Z probe: MINTEMP kill), each in its own task.
 // X Y: fast to the min endstop with M120 on, 1 mm back, slow in, M119 must show it pressed.
 // Z: steps toward the switch on the probe line (0.5 mm), reading M119 after each step, 1 mm

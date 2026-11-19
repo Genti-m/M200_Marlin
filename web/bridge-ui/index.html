@@ -60,9 +60,9 @@
     <!-- The real head position (last M114, sent after every jog / preset / home), like a preset frame -->
     <div class="live off" id="live">
       <div class="frame live-xy" id="live-xy" title="X Y from the last M114: 0 = the switches">
-        <span class="dot-at" id="live-dot"></span><span class="lbl" id="live-lbl">Home X Y to see the head</span>
+        <div class="live-area"><span class="dot-at" id="live-dot"></span></div><span class="lbl" id="live-lbl">Home X Y to see the head</span>
       </div>
-      <div class="live-z" id="live-z" title="Z from the last M114: 0 = the switch"><i id="live-zmark"></i><small>Z</small></div>
+      <div class="live-z" id="live-z" title="Z from the last M114: 0 = the switch"><div class="live-area"><i id="live-zmark"></i></div><small>Z</small></div>
     </div>
     <div class="row"><span class="muted" id="busy"></span></div>
   </section>

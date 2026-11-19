@@ -69,6 +69,9 @@ printer_link_state_t printer_link_get_state(void);
 // Lines waiting in the queue (not counting the one in flight).
 uint32_t printer_link_queue_len(void);
 
+// Free places in the queue: a batch that must go in whole (a jog) checks this first.
+uint32_t printer_link_queue_free(void);
+
 const char *printer_link_state_name(printer_link_state_t state);
 
 #ifdef __cplusplus

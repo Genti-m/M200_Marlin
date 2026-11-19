@@ -45,7 +45,7 @@ Example:
 
 | `t` | Fields | Effect |
 |-----|--------|--------|
-| `gcode` | `lines`: array of strings | each line goes into `printer_send(line, PRINTER_SRC_WEB)`, in order. `M108` / `M410` go to `printer_emergency()` instead, `M112` does the same as `stop`. Other lines pass `printer_state_allow()` first: refused while `stopped` or `homing`, any heat command (target above 0), `M303`, every `G28` / `G29` / `G30` / `M48`, and moves taking a homed axis outside `0..max` (an `Error:bridge: ...` line says why) |
+| `gcode` | `lines`: array of strings | the batch goes into the printer queue **whole or not at all**: if it doesn't fit (16 lines), nothing is sent, the homes stay, and an `Error:bridge: busy, ...` line says so. Each line goes into `printer_send(line, PRINTER_SRC_WEB)`, in order. `M108` / `M410` go to `printer_emergency()` instead, `M112` does the same as `stop`. Other lines pass `printer_state_allow()` first: refused while `stopped` or `homing`, any heat command (target above 0), `M303`, every `G28` / `G29` / `G30` / `M48`, and moves taking a homed axis outside `0..max` (an `Error:bridge: ...` line says why) |
 | `auth` | `token` | log this connection in (see Authentication). Answer: an `auth` message |
 | `stop` | none | `printer_state_soft_stop()`: queue cleared, `M410` sent at once, then `M104 S0`, `M140 S0`, `M107`, `M84`, `G90`, `M121`. Aborts a running home. Marlin keeps running (no `kill()`, no power-cycle). Without `EMERGENCY_PARSER` Marlin runs `M410` only after the current command. Sets `stopped` |
 | `restart` | none | clears `stopped`. Home again before moving |
@@ -76,7 +76,7 @@ Unknown messages are ignored. Lines longer than 96 chars are dropped (`PRINTER_L
 | Method + path | Body | Answer |
 |---------------|------|--------|
 | `GET /api/state` | | the `state` object (without `t`) |
-| `POST /api/gcode` | `text/plain`, one G-code line per text line | `{"queued": n}` (token) |
+| `POST /api/gcode` | `text/plain`, one G-code line per text line | `{"queued": n}` (token). Whole or nothing like `gcode`: 503 `{"queued":0,"error":"busy..."}` if the lines don't fit in the queue |
 | `GET /api/settings` | | `{"v": {...}, "d": {...}}` like the `settings` message |
 | `POST /api/settings` | JSON object of setting keys | `{"ok": true}` or `{"ok": false, "error": "..."}` (same as `settings_set`; token) |
 | `POST /api/stop` | | `{"ok": true}` (same as `stop`; never needs the token) |

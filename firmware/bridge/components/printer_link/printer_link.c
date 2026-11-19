@@ -252,6 +252,11 @@ uint32_t printer_link_queue_len(void)
     return s_queue ? (uint32_t)uxQueueMessagesWaiting(s_queue) : 0;
 }
 
+uint32_t printer_link_queue_free(void)
+{
+    return s_queue ? (uint32_t)uxQueueSpacesAvailable(s_queue) : 0;
+}
+
 const char *printer_link_state_name(printer_link_state_t state)
 {
     switch (state) {
