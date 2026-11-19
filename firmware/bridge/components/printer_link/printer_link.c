@@ -45,10 +45,16 @@ static void set_state(printer_link_state_t state)
     esp_event_post(PRINTER_EVENT, PRINTER_EVENT_LINK_STATE, &state, sizeof(state), 0);
 }
 
+// One uart_write_bytes() call per line: the driver holds its TX lock for the whole call, so
+// printer_emergency() (any task) can't land between a line and its '\n' from the TX task.
+// Two calls could interleave into "G1 X10M112\n\n", which Marlin would read as one bad line.
 static void uart_write_line(const char *text)
 {
-    uart_write_bytes(UART_PORT, text, strlen(text));
-    uart_write_bytes(UART_PORT, "\n", 1);
+    char buf[PRINTER_LINE_MAX + 1];
+    size_t n = strnlen(text, PRINTER_LINE_MAX - 1);
+    memcpy(buf, text, n);
+    buf[n++] = '\n';
+    uart_write_bytes(UART_PORT, buf, n);
 }
 
 static void post_tx(const char *text, printer_source_t source, bool emergency)

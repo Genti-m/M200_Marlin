@@ -20,3 +20,6 @@ Thumbs.db
 # Python tools
 __pycache__/
 .venv/
+
+# per-machine VS Code settings (absolute paths)
+firmware/.vscode/

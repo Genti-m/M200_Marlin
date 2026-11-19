@@ -10,6 +10,7 @@
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
+#include "gcode_guard.h"
 #include "nvs.h"
 
 static const char *TAG = "printer_state";
@@ -50,27 +51,11 @@ static const printer_setting_desc_t SETTINGS[PS_COUNT] = {
     [PS_PRESET_EDGE] = {"preset_edge", 10, 0, 40, 1},
 };
 
-// One axis as the bridge tracks it from the lines it lets through (Marlin is never homed:
-// no G28). l is Marlin's logical position, zero the logical position of the switch found by
-// the bridge's home (G92 shifts both), dir +1 when Marlin's numbers grow away from the switch
-// (-1 for Z with z_dir +1). The machine position, 0..max, is dir * (l - zero).
-typedef struct {
-    bool homed;
-    float l, zero, dir;
-} axis_t;
-
-static float machine(const axis_t *a, float l)
-{
-    return a->dir * (l - a->zero);
-}
-
 static struct {
     float cfg[PS_COUNT];  // settings
     marlin_temp_t nozzle, bed;
-    axis_t ax[3];
-    bool relative;       // G91
-    uint8_t home_mask;   // axes the next internal G92 marks homed (end of a home task)
-    bool homing;         // a home task is running: user G-code refused
+    gcode_motion_t mo;   // homed axes, G90/G91, home_mask (gcode_guard)
+    bool homing;        // a home task is running: user G-code refused
     bool home_abort;     // set by STOP / kill / reset / emergency: the running home gives up.
                          // Only a new home clears it, so RESTART or a reboot can't revive one.
     bool sw[3];          // last M119: x_min, y_min, z_probe pressed
@@ -130,71 +115,15 @@ static void push_temp_sample(int64_t now)
     }
 }
 
-// Code of a G/M word at the start of the line ("N12 G28 X" -> 28 for 'G'), else -1.
-// *rest points behind the number. Marlin needs no spaces ("N12G28X", "M104S200"), so the
-// number may be followed directly by the next word.
-static int command_code(const char *line, char letter, const char **rest)
-{
-    while (*line == ' ') {
-        line++;
-    }
-    if (toupper((unsigned char)*line) == 'N' && isdigit((unsigned char)line[1])) {  // line number
-        line++;
-        while (isdigit((unsigned char)*line)) {
-            line++;
-        }
-        while (*line == ' ') {
-            line++;
-        }
-    }
-    if (toupper((unsigned char)*line) != letter || !isdigit((unsigned char)line[1])) {
-        return -1;
-    }
-    int code = 0;
-    line++;
-    while (isdigit((unsigned char)*line)) {
-        code = code * 10 + (*line++ - '0');
-    }
-    if (*line == '.') {
-        return -1;  // e.g. "G28.1"
-    }
-    if (rest) {
-        *rest = line;
-    }
-    return code;
-}
-
 static void unhome(void)
 {
-    for (int i = 0; i < 3; i++) {
-        s.ax[i].homed = false;
-    }
-    s.home_mask = 0;
+    gcode_unhome(&s.mo);
     s.pos_valid = false;
 }
 
-// Value of one word in what follows the command code (" S200", 'S' -> 200). A word starts
-// after anything that isn't a letter, so "X10Y20" is two words like Marlin reads it.
-static bool num_param(const char *rest, char letter, float *out)
+static bool any_homed(void)
 {
-    char prev = ' ';
-    for (const char *p = rest; *p && *p != ';' && *p != '*'; prev = *p++) {
-        if (toupper((unsigned char)*p) == letter && !isalpha((unsigned char)prev)) {
-            char *end;
-            float v = strtof(p + 1, &end);
-            if (end != p + 1) {
-                *out = v;
-                return true;
-            }
-        }
-    }
-    return false;
-}
-
-// Target of a heater command: S, or R for M109/M190 ("wait, also when cooling").
-static bool target_param(const char *rest, float *out)
-{
-    return num_param(rest, 'S', out) || num_param(rest, 'R', out);
+    return s.mo.ax[0].homed || s.mo.ax[1].homed || s.mo.ax[2].homed;
 }
 
 static bool unplugged(const marlin_temp_t *t)
@@ -216,10 +145,10 @@ static void halt(void)
 static bool on_tx(const printer_tx_event_t *ev)
 {
     const char *rest = NULL;
-    int g = command_code(ev->text, 'G', &rest);
-    int m = command_code(ev->text, 'M', g < 0 ? &rest : NULL);
+    int g = gcode_command_code(ev->text, 'G', &rest);
+    int m = gcode_command_code(ev->text, 'M', g < 0 ? &rest : NULL);
     float target;
-    if ((m == 104 || m == 109 || m == 140 || m == 190) && target_param(rest, &target)) {
+    if ((m == 104 || m == 109 || m == 140 || m == 190) && gcode_heater_target(rest, &target)) {
         // Show a new target at once (Off -> 0), the next temp report confirms it.
         marlin_temp_t *t = (m == 140 || m == 190) ? &s.bed : &s.nozzle;
         t->target = target;
@@ -229,46 +158,17 @@ static bool on_tx(const printer_tx_event_t *ev)
         s.home_abort = true;  // its queued lines are dropped
     }
     if (m == 84 || m == 18 || m == 112 || ev->emergency) {
-        bool changed = s.pos_valid || s.ax[0].homed || s.ax[1].homed || s.ax[2].homed;
+        bool changed = s.pos_valid || any_homed();
         unhome();
         return changed;
     }
     return false;
 }
 
-// Follow a line on its way to the printer (accepted user line or a home task line): G90/G91,
-// G92 and moves update the homed axes. s_mux held.
+// Follow a line on its way to the printer (accepted user line or a home task line). s_mux held.
 static void track(const char *line)
 {
-    const char *rest = NULL;
-    int g = command_code(line, 'G', &rest);
-    if (g == 90 || g == 91) {
-        s.relative = g == 91;
-        return;
-    }
-    if (g != 92 && (g < 0 || g > 3)) {
-        return;
-    }
-    for (int i = 0; i < 3; i++) {
-        axis_t *a = &s.ax[i];
-        float v;
-        if (!num_param(rest, AXES[i], &v)) {
-            continue;
-        }
-        if (g == 92 && (s.home_mask & (1u << i))) {  // end of a home: the switch is 0
-            s.home_mask &= ~(1u << i);
-            a->homed = true;
-            a->dir = i == 2 ? -s.cfg[PS_Z_DIR] : 1;
-            a->l = a->zero = v;
-        } else if (!a->homed) {
-            continue;
-        } else if (g == 92) {  // same place, new number
-            a->zero += v - a->l;
-            a->l = v;
-        } else {
-            a->l = s.relative ? a->l + v : v;
-        }
-    }
+    gcode_track(&s.mo, line, s.cfg[PS_Z_DIR]);
 }
 
 // A line from the printer. Returns true if the state changed.
@@ -307,7 +207,7 @@ static bool on_rx(const printer_rx_event_t *ev, int64_t now, bool *send_autorepo
     case MARLIN_LINE_START:
         unhome();
         s.home_abort = true;  // a home's moves must not go on into a fresh Marlin
-        s.relative = false;  // Marlin boots in G90
+        s.mo.relative = false;  // Marlin boots in G90
         s.halted = false;
         s.stopped = false;  // fresh boot: nothing left to stop
         s.nozzle.valid = s.bed.valid = false;
@@ -519,10 +419,11 @@ void printer_state_get(printer_state_t *out)
     out->bed = s.bed;
     out->busy = s.last_busy_us > 0 && now - s.last_busy_us <= BUSY_HOLD_US;
     for (int i = 0; i < 3; i++) {
-        out->homed[i] = s.ax[i].homed;
-        out->mpos[i] = machine(&s.ax[i], s.ax[i].l);
-        out->zero[i] = s.ax[i].zero;
-        out->dir[i] = s.ax[i].homed ? s.ax[i].dir : 1;
+        const gcode_axis_t *a = &s.mo.ax[i];
+        out->homed[i] = a->homed;
+        out->mpos[i] = gcode_machine(a, a->l);
+        out->zero[i] = a->zero;
+        out->dir[i] = a->homed ? a->dir : 1;
         out->max_mm[i] = s.cfg[PS_MAX_X + i];
     }
     out->homing = s.homing;
@@ -555,51 +456,10 @@ static const char *refusal(const char *line, printer_source_t source)
     if (s.homing) {
         return "Error:bridge: homing running, wait for it (STOP aborts it)";
     }
-    const char *rest = NULL;
-    int g = command_code(line, 'G', &rest);
-    int m = command_code(line, 'M', g < 0 ? &rest : NULL);
-    float target;
-
-    // Laser build: heaters and sensors are removed (road_Change.md ch. 1). Marlin kill()s
-    // (MINTEMP / heating failed) as soon as a heater target is above 0, so none ever goes out.
-    // Target 0 (off) is harmless and still passes: soft STOP sends it.
-    if ((m == 104 || m == 109 || m == 140 || m == 190) && target_param(rest, &target) &&
-        target > 0) {
-        return "Error:bridge: laser build, no heaters: heating refused (S0 / off works)";
-    }
-    if (m == 303) {
-        return "Error:bridge: laser build, no heaters: PID autotune refused";
-    }
-    // Probing preheats nozzle 180 / bed 30 first (PREHEAT_BEFORE_PROBING): MINTEMP kill.
-    // G28 homes Z with the probe, so it does the same after moving to the bed center, and
-    // the Zortrax G28 homes Z even for "G28 R0 X Y". So no G28 at all: the web Home seeks
-    // the X/Y endstops with plain moves (road_Change.md ch. 3).
-    if (g == 29 || g == 30 || m == 48) {
-        return "Error:bridge: laser build, probing refused (its preheat stops Marlin)";
-    }
-    if (g == 28) {
-        return "Error:bridge: laser build, G28 refused (its Z preheat stops Marlin). Use the Home button";
-    }
-    // Homed axes stay within 0..max (settings) of the switch the bridge's home found (Marlin has
-    // no soft limits: it is never homed). Arcs: only the end point is checked.
-    if (g >= 0 && g <= 3) {
-        for (int i = 0; i < 3; i++) {
-            const axis_t *a = &s.ax[i];
-            float v;
-            if (!a->homed || !num_param(rest, AXES[i], &v)) {
-                continue;
-            }
-            float m_to = machine(a, s.relative ? a->l + v : v);
-            float max = s.cfg[PS_MAX_X + i];
-            if (!(m_to >= -0.001f && m_to <= max + 0.001f)) {  // also refuses "Xnan"
-                static char msg[96];  // s_mux held
-                snprintf(msg, sizeof(msg), "Error:bridge: %c would go to %.2f mm from home, limit 0..%g",
-                         AXES[i], (double)m_to, (double)max);
-                return msg;
-            }
-        }
-    }
-    return NULL;
+    // Heat, G28 / probing, and the 0..max limits (settings): gcode_guard, host-tested.
+    static char msg[96];  // s_mux held
+    const float max_mm[3] = {s.cfg[PS_MAX_X], s.cfg[PS_MAX_Y], s.cfg[PS_MAX_Z]};
+    return gcode_refusal(&s.mo, max_mm, line, msg, sizeof(msg));
 }
 
 bool printer_state_allow(const char *line, printer_source_t source)
@@ -620,7 +480,7 @@ bool printer_state_allow(const char *line, printer_source_t source)
 void printer_state_dropped(const char *line)
 {
     xSemaphoreTake(s_mux, portMAX_DELAY);
-    bool had = s.ax[0].homed || s.ax[1].homed || s.ax[2].homed;
+    bool had = any_homed();
     unhome();
     xSemaphoreGive(s_mux);
     char msg[96];
@@ -745,7 +605,7 @@ static const char *home_xy_run(void)
         return why;
     }
     xSemaphoreTake(s_mux, portMAX_DELAY);
-    s.home_mask |= 1u << 0 | 1u << 1;
+    s.mo.home_mask |= 1u << 0 | 1u << 1;
     xSemaphoreGive(s_mux);
     char park[40];
     snprintf(park, sizeof(park), "G1 X%.1f Y%.1f F%d", (double)hc[PS_PARK], (double)hc[PS_PARK],
@@ -813,7 +673,7 @@ static const char *home_z_run(void)
         return r < 0 ? HOME_FAILED : "Error:bridge: Z switch not found again on the slow pass";
     }
     xSemaphoreTake(s_mux, portMAX_DELAY);
-    s.home_mask |= 1u << 2;
+    s.mo.home_mask |= 1u << 2;
     xSemaphoreGive(s_mux);
     // Park away from the switch: Marlin Z +park for z_dir -1, -park for z_dir +1 (track()
     // counts the machine position away from the switch either way).
@@ -839,7 +699,7 @@ static void home_task(void *arg)
     const char *why = job->run();
     xSemaphoreTake(s_mux, portMAX_DELAY);
     s.homing = false;
-    s.home_mask = 0;
+    s.mo.home_mask = 0;
     xSemaphoreGive(s_mux);
     if (why) {
         ESP_LOGW(TAG, "%s", why);
@@ -860,7 +720,7 @@ static esp_err_t home_start(const home_job_t *job, uint8_t axes, const char *not
         memcpy(hc, s.cfg, sizeof(hc));
         for (int i = 0; i < 3; i++) {
             if (axes & (1u << i)) {
-                s.ax[i].homed = false;
+                s.mo.ax[i].homed = false;
             }
         }
     }
@@ -899,7 +759,7 @@ esp_err_t printer_state_soft_stop(printer_source_t source)
     s.stopped = true;
     s.home_abort = true;
     unhome();  // M410 can lose steps, and M84 drops the position anyway
-    s.relative = false;
+    s.mo.relative = false;
     xSemaphoreGive(s_mux);
     esp_event_post(PRINTER_STATE_EVENT, PRINTER_STATE_EVENT_CHANGED, NULL, 0, 0);
 

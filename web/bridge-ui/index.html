@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>M200 Bridge</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="top">
+  <h1>M200</h1>
+  <div class="dots">
+    <span class="dot" id="dot-printer" title="printer link"><i></i>printer</span>
+    <span class="dot" id="dot-ws" title="connection to the bridge"><i></i>bridge</span>
+    <span class="dot" id="dot-wifi" title="WiFi signal of the bridge"><i></i><span id="rssi">wifi</span></span>
+  </div>
+  <button id="open-settings" class="gear" type="button" title="Setting tweaking" aria-label="Setting tweaking" aria-haspopup="dialog">
+    <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true"><path fill="currentColor" d="M19.4 13a7.6 7.6 0 0 0 0-2l2.1-1.6a.5.5 0 0 0 .1-.6l-2-3.5a.5.5 0 0 0-.6-.2l-2.5 1a7.3 7.3 0 0 0-1.7-1l-.4-2.6a.5.5 0 0 0-.5-.4h-4a.5.5 0 0 0-.5.4l-.4 2.6a7.3 7.3 0 0 0-1.7 1l-2.5-1a.5.5 0 0 0-.6.2l-2 3.5a.5.5 0 0 0 .1.6L4.6 11a7.6 7.6 0 0 0 0 2l-2.1 1.6a.5.5 0 0 0-.1.6l2 3.5c.1.2.4.3.6.2l2.5-1c.5.4 1.1.7 1.7 1l.4 2.6c0 .2.2.4.5.4h4c.3 0 .5-.2.5-.4l.4-2.6a7.3 7.3 0 0 0 1.7-1l2.5 1c.2.1.5 0 .6-.2l2-3.5a.5.5 0 0 0-.1-.6L19.4 13zM12 15.5a3.5 3.5 0 1 1 0-7 3.5 3.5 0 0 1 0 7z"/></svg>
+  </button>
+  <button id="stop" class="stop" type="button">STOP</button>
+</header>
+
+<main class="grid">
+  <section class="card pos">
+    <h2>Position
+      <span class="badges" title="Homed by the bridge: 0 = the switch, limits in Setting tweaking">
+        <span class="badge" id="homed-x">X</span><span class="badge" id="homed-y">Y</span><span class="badge" id="homed-z">Z</span>
+      </span>
+    </h2>
+    <div class="xyz">
+      <div><small>X</small><span id="pos-x">--</span></div>
+      <div><small>Y</small><span id="pos-y">--</span></div>
+      <div><small>Z</small><span id="pos-z">--</span></div>
+    </div>
+    <div class="row"><span class="muted" id="busy"></span><button type="button" id="pos-refresh">Refresh</button></div>
+  </section>
+
+  <section class="card jog">
+    <h2>Move</h2>
+    <div class="pad">
+      <button type="button" data-jog="Y" data-dir="1" style="grid-area:yp">Y+</button>
+      <button type="button" data-jog="X" data-dir="-1" style="grid-area:xm">X-</button>
+      <button type="button" id="home" class="home" style="grid-area:hm" title="Home X Y on their endstops, then park off the switches (the bridge does it: G28 stops Marlin)">⌂</button>
+      <button type="button" data-jog="X" data-dir="1" style="grid-area:xp">X+</button>
+      <button type="button" data-jog="Y" data-dir="-1" style="grid-area:ym">Y-</button>
+      <button type="button" data-jog="Z" data-dir="1" style="grid-area:zp">Z+</button>
+      <button type="button" data-jog="Z" data-dir="-1" style="grid-area:zm">Z-</button>
+      <button type="button" id="home-z" class="home" style="grid-area:zh" title="Home Z on the switch (seek steps, back off, fine steps), then park off the switch">⌂Z</button>
+    </div>
+    <div class="steps" role="radiogroup" aria-label="Step size">
+      <button type="button" data-step="0.1">0.1</button>
+      <button type="button" data-step="1" class="on">1</button>
+      <button type="button" data-step="10">10</button>
+      <span class="muted">mm</span>
+    </div>
+    <label class="toggle free-move" title="Axes that aren't homed have no limits. Endstop switches are watched during the move (M120), but nothing stops an axis at the far end"><input type="checkbox" id="free-move"> move without homing <span class="muted">(no limits, can crash)</span></label>
+    <div class="row"><span class="muted" id="jog-hint">Home first to move</span><button type="button" id="motors-off">Motors off</button></div>
+  </section>
+
+  <section class="card presets">
+    <h2>Presets <span class="muted" id="preset-range">X Y, % of the travel</span></h2>
+    <div class="frames" id="frames"></div>
+    <div class="muted" id="preset-hint">Home X Y first</div>
+  </section>
+
+  <section class="card console">
+    <h2>Console
+      <label class="toggle"><input type="checkbox" id="show-all"> show ok / reports</label>
+    </h2>
+    <div class="quick">
+      <button type="button" data-cmd="M114">M114</button>
+      <button type="button" data-cmd="M119">M119</button>
+      <button type="button" data-cmd="M115">M115</button>
+      <button type="button" data-cmd="M503">M503</button>
+      <button type="button" id="clear" class="ghost">clear</button>
+    </div>
+    <div id="log" class="log" aria-live="polite"></div>
+    <form id="cmd" class="cmd">
+      <input id="cmd-in" autocomplete="off" autocapitalize="characters" spellcheck="false" placeholder="G-code, ↑/↓ for history" maxlength="96">
+      <button type="submit">Send</button>
+    </form>
+  </section>
+</main>
+<dialog id="settings" class="sheet" aria-labelledby="settings-title">
+  <form method="dialog" id="settings-form" novalidate>
+    <div class="sheet-bar">
+      <button type="button" class="bar-btn" id="settings-cancel">Cancel</button>
+      <h3 id="settings-title" tabindex="-1" autofocus>Setting tweaking</h3>
+      <button type="submit" class="bar-btn strong" id="settings-save">Save</button>
+    </div>
+    <div class="sheet-body" id="settings-body"></div>
+  </form>
+</dialog>
+<script src="app.js"></script>
+</body>
+</html>

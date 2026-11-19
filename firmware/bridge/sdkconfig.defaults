@@ -17,3 +17,7 @@ CONFIG_HTTPD_WS_SUPPORT=y
 # The web/state handlers run in the default event loop task: more stack and a longer queue
 CONFIG_ESP_SYSTEM_EVENT_TASK_STACK_SIZE=4096
 CONFIG_ESP_SYSTEM_EVENT_QUEUE_SIZE=64
+
+# OTA rollback: a new image must confirm itself (main.c, once WiFi is up), else the bootloader
+# boots the previous one. Lives in the bootloader: flash once over USB after changing it.
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y

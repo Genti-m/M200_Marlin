@@ -24,7 +24,8 @@ controlled. This file grows one chapter at a time, as each step is done.
 - [x] 4. Web page for the laser: no heating, preset frames
 - [x] 5. Review fixes: guard parsing, home abort, queue full
 - [x] 6. Setting tweaking: limits and homing / move tunables, saved on the bridge
-- [ ] Laser on/off and power control
+- [x] 7. Foundation: guard host tests, single-write UART lines, API token, OTA rollback, CI
+- [ ] 8. Laser safety and laser on/off / power control (kept up to date when the laser goes in)
 
 ## 1. Hardware: heaters and sensors out (done)
 
@@ -145,10 +146,52 @@ are still enforced in the firmware for every client (web, console, REST).
 - **Z direction works both ways**: each axis tracks Marlin's coordinate of its switch and a
   direction, so with +Z the 0..max limits, the park and the web jogs all count away from the
   switch. The state message now has `zero` and `dir` instead of `off`, and `max` is per axis.
+- The sheet opens offline too. It shows the last values the bridge sent (kept in the browser),
+  or the defaults if it never connected. Save is greyed out until the bridge is online.
 - A home uses the settings it started with. A change made later applies to the next home.
 - Also: `GET` / `POST /api/settings`, the `settings` / `settings_set` WebSocket messages
   (`docs/protocol.md`), and the mock bridge keeps settings in memory.
 - Tested on the mock: settings round trip, a bad value refused, refused while homing, a new
   max X of 100 refusing X120. The sheet was screenshotted at desktop and 390 px phone width.
   Not on the printer yet.
+
+## 7. Foundation fixes (done, built, not flashed yet)
+
+A project review found gaps outside the laser work. All are fixed, the laser is untouched.
+
+| Problem | Fix |
+|---|---|
+| `wifi_link`, `web/bridge-ui/`, `docs/protocol.md` and `tools/mock_bridge.py` were never committed: a fresh clone didn't build | committed |
+| The guard rules (heat, `G28`, limits) had no tests | moved, unchanged, out of `printer_state.c` into the pure-C component `gcode_guard`, with a PC test (`test/test_gcode_guard.c`): unspaced G-code, `N` numbers, NaN, relative moves, `G92` after a home, both Z directions. Run with `sh tools/run_host_tests.sh` (needs gcc / clang) |
+| `M104 Snan` passed the heat check (`nan > 0` is false) | the check is written so NaN fails it, like the limits |
+| A line and its `
+` were two UART writes, so an emergency line from another task could land between them (`G1 X10M112`), and Marlin read one bad line | one write per line (`printer_link.c`) |
+| `POST /api/ota` was open to the whole network | **API token** (NVS), set on the USB console: `!token <secret>`, `!token`, `!token clear`. OTA always needs it (`X-Token` header, refused while none is set). With a token set every write needs it too: REST via `X-Token`, the web page asks once and keeps it in the browser. STOP never needs it. Viewing stays open |
+| No OTA rollback: an update that breaks WiFi needed USB | `CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE`: a new image is kept only once WiFi is back (120 s), else, or after a crash, the bootloader boots the old one |
+| No CI | `.github/workflows/ci.yml`: host tests with ASan/UBSan, and the firmware build with IDF v6.1.1 |
+| The mock read only spaced G-code | `parse_gcode()` reads it like `gcode_guard` |
+
+To do once, over USB: the rollback option lives in the **bootloader**, which OTA never
+rewrites. Delete `sdkconfig` (it is generated; the new default only applies to a fresh one),
+then Build, **Flash** (USB, COM7). Then `!token <secret>` on the console. OTA from now on:
+
+```
+curl -H "X-Token: <secret>" --data-binary @build/m200_bridge.bin http://m200.local/api/ota
+```
+
+## 8. Laser safety (open: kept up to date when the laser goes in)
+
+Not started on purpose: nothing here is built yet. This chapter collects what has to be in
+place **before** the laser module is fitted, and is filled in step by step with that work.
+
+- **Hardware interlock and E-stop** that cut the laser power directly, not through G-code.
+  Today STOP waits behind the running Marlin command (no `EMERGENCY_PARSER`), which is not
+  enough for a laser.
+- **Laser-off watchdog on the bridge**: laser off when the web / WebSocket client that runs
+  a job goes away, or the printer link stops answering.
+- **Off by default**: laser off at bridge boot, after a printer reset (`start`), on soft STOP
+  and on kill.
+- How the laser is switched (fan output / `M106`, a spare pin, or a separate driver input),
+  and which commands the bridge then lets through or refuses.
+- Enclosure, eye protection, fire watch.
 

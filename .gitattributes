@@ -1,0 +1,2 @@
+# shell scripts run in CI (Linux) and Git Bash: keep LF
+*.sh text eol=lf

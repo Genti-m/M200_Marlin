@@ -1,0 +1,32 @@
+# Every push / PR: the PC unit tests of the pure-C parts, and a full firmware build.
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  host-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Unit tests (marlin_proto, gcode_guard) with ASan/UBSan
+        run: sh tools/run_host_tests.sh
+
+  firmware:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build bridge firmware (ESP-IDF v6.1.1, esp32s3)
+        uses: espressif/esp-idf-ci-action@v1
+        with:
+          esp_idf_version: v6.1.1
+          target: esp32s3
+          path: firmware/bridge
+      - uses: actions/upload-artifact@v4
+        with:
+          name: m200_bridge
+          path: |
+            firmware/bridge/build/m200_bridge.bin
+            firmware/bridge/build/bootloader/bootloader.bin
+            firmware/bridge/build/partition_table/partition-table.bin

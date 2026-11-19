@@ -1,0 +1,11 @@
+{
+    // Open this file (File -> Open Workspace from File...) instead of a folder.
+    // "bridge firmware" is the ESP-IDF project: build, flash and monitor run there.
+    "folders": [
+        { "name": "bridge firmware", "path": "firmware/bridge" },
+        { "name": "repo", "path": "." }
+    ],
+    "settings": {
+        "files.exclude": { "**/build": true }
+    }
+}

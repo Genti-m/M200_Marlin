@@ -1,6 +1,6 @@
 # Zortrax M200 WiFi bridge - status and plan
 
-Updated: 2026-11-18
+Updated: 2026-11-19
 Drawing: `drawings/Status and plan.excalidraw`
 
 ## Where we are
@@ -21,9 +21,11 @@ All the hardware facts are confirmed. Next comes the ESP32-S3 firmware.
 
 | DEBUG pin | ESP32-S3 |
 |-----------|----------|
-| 3 (printer TX) | GPIO18 (RX) |
-| 4 (printer RX) | GPIO17 (TX) |
+| 3 (printer TX) | GPIO18 (RX), via 1 kΩ |
+| 4 (printer RX) | GPIO17 (TX), via 1 kΩ |
 | 7 (GND) | GND |
+
+(Same table as the README; GPIOs are Kconfig `PRINTER_LINK_TX_GPIO` / `_RX_GPIO`.)
 
 During development, power the ESP32-S3 from the PC's USB. Later use a 24 V -> 5 V buck converter.
 The Arduino Nano was only for tests. **Never connect the Nano to pin 4**: it would drive 5 V into the STM32.
@@ -38,19 +40,21 @@ The Arduino Nano was only for tests. **Never connect the Nano to pin 4**: it wou
 5. Select the COM port, then **ESP-IDF: Build, Flash and Monitor** (also in the status bar).
    - If you use the board's "USB" port (not "UART"), set `Component config -> ESP System Settings -> Channel for console output` to **USB Serial/JTAG** in menuconfig.
 
-### Project layout (planned)
+### Project layout (as built)
 ```
-m200_bridge/
-  main/
-    main.c           start-up, creates the tasks
-    printer_uart.c   UART1 @ 250000, line reader, command queue, "ok" handling
-    wifi.c           WiFi station + mDNS (m200.local), credentials in NVS
-    web.c            HTTP server: web interface, REST (/api/...), WebSocket console
-    telnet.c         TCP port 23 raw console
-    ble_nus.c        NimBLE Nordic UART Service (phone)
-    www/index.html   web interface, embedded in the firmware
-  main/idf_component.yml   espressif/mdns
-  sdkconfig.defaults       NimBLE on, console settings
+firmware/bridge/                 ESP-IDF project (m200_bridge)
+  main/main.c                    start-up only: NVS, netif, starts the components, OTA confirm
+  main/console_bridge.c          USB console: G-code + "!" bridge commands (!wifi, !token, !homexy, ...)
+  components/marlin_proto/       pure C: parse Marlin replies (ok, busy, Resend, T:/B:) + PC test
+  components/gcode_guard/        pure C: laser-build G-code rules + axis tracking + PC test
+  components/printer_link/       owns UART1: queue, one line in flight, waits for "ok"
+  components/printer_state/      state, history, settings (NVS), bridge homing tasks
+  components/web_server/         HTTP, WebSocket /ws, REST /api/*, OTA, API token
+  sdkconfig.defaults, partitions.csv (2 OTA slots + littlefs)
+firmware/shared/components/wifi_link/   WiFi station + mDNS (m200.local), credentials in NVS
+web/bridge-ui/                   index.html / style.css / app.js, gzipped into the firmware
+tools/mock_bridge.py             fake bridge + Marlin on the PC, same protocol
+tools/run_host_tests.sh          PC unit tests (also run by .github/workflows/ci.yml)
 ```
 
 ### Design rules
@@ -65,17 +69,31 @@ m200_bridge/
 | 0 | Find TX/RX/GND | **done** (DEBUG 3/4/7, 250000) |
 | 1 | ESP-IDF setup | **done** 2026-11-18 (IDF v6.1.1, flashed over native USB COM7, heartbeat on monitor) |
 | 2 | UART bridge | **done** 2026-11-18 (`M115` answered both ways, caps in `marlin_caps.md`) |
-| 3 | WiFi + mDNS | `ping m200.local` works, credentials stored in NVS |
-| 4 | **Web interface** | `http://m200.local`: temps, Home / Motors off / Preheat / STOP buttons, live console |
-| 5 | Telnet + BLE | `telnet m200.local 23` and nRF Connect both send `M105` and see the reply |
+| 3 | WiFi + mDNS | **code done** 2026-11-18, builds; test on hardware: `ping m200.local` works, credentials stored in NVS |
+| 4 | **Web interface** | **code done** 2026-11-18, builds; test on hardware: `http://m200.local`: temps, Home / Motors off / Preheat / STOP buttons, live console |
+| 5 | Telnet + BLE (not started) | `telnet m200.local 23` and nRF Connect both send `M105` and see the reply |
 | 6 | Printing from SD | file list (`M20`), start (`M23` + `M24`), pause/resume, progress bar (`M27`) |
-| 7 | Install | buck converter, case inside the base, access token on the web API |
+| 7 | Install | buck converter, case inside the base. Access token on the web API: **code done** 2026-11-19 (`!token`, see `protocol.md`) |
+
+## Milestones 3 + 4: first test on the hardware
+
+1. Build, Flash and Monitor (USB, COM7) as before. The new `sdkconfig` was regenerated from `sdkconfig.defaults`.
+2. In the monitor type `!wifi <ssid> <password>` (SSID in "quotes" if it has spaces). Stored in NVS, survives reflashing.
+   Wait for `connected, IP 192.168.x.y -> http://m200.local`. `!net` shows the status at any time, `!help` lists the commands.
+3. PC: `ping m200.local`, then open `http://m200.local` (if `.local` doesn't resolve on Windows, use the IP).
+4. Printer on: temps appear in about 2 s (`M155 S2` is sent at boot and after every printer reset).
+5. Check: Home -> "homed" badge, jog 1 mm, Set/Off on hotend and bed, console quick buttons, STOP (tap twice).
+6. Set an API token: `!token <secret>` (OTA is refused without one). From then on firmware updates can go over WiFi:
+   `curl -H "X-Token: <secret>" --data-binary @build/m200_bridge.bin http://m200.local/api/ota`.
+   A new image that gets no WiFi within 120 s is rolled back (needs the rollback bootloader: one USB flash after a fresh `sdkconfig`, see `road_Change.md` ch. 7).
+
+UI changes without the printer: `python tools/mock_bridge.py` -> http://localhost:8080 (same protocol, fake Marlin).
 
 ## Open points (small)
 - ~~`Hardcoded Default Settings Loaded`: try `M500`~~ -> `Cap:EEPROM:0`, this build can't save settings (see `marlin_caps.md`).
-- `Cap:EMERGENCY_PARSER:0`: STOP (`M112`) only runs after the current command. Check during a `G28` whether `busy:` lines appear (sets the `ok` timeout).
+- `Cap:EMERGENCY_PARSER:0`: STOP (`M112`) only runs after the current command. Marlin 2.x sends busy as `echo:busy: processing`; `marlin_proto` now treats that as BUSY (it was ECHO, so the `ok` timeout never restarted). Confirm during a real `G28`.
 - Pick the buck converter after measuring the PSU voltage (24 V expected).
-- The web page and telnet have no password at first: home network only, add a token in milestone 7.
+- API token done (web + REST, `!token`). Telnet, when it comes (milestone 5), must use it too. Still home network only: no TLS.
 
 ## Reference files
 - `howToWifi.md`: full background, the Arduino version of the bridge, BLE usage.

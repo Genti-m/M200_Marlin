@@ -13,6 +13,7 @@
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "api_token.h"
 #include "json_util.h"
 #include "printer_link.h"
 #include "printer_state.h"
@@ -191,6 +192,7 @@ static bool build_hello(jbuf_t *b)
     jb_str(b, wifi_link_hostname());
     jb_puts(b, ",\"fw\":");
     jb_str(b, esp_app_get_description()->version);
+    jb_printf(b, ",\"auth\":\"%s\"", web_server_token_is_set() ? "required" : "open");
     jb_puts(b, ",\"history\":[");
     for (size_t i = 0; i < nl; i++) {
         if (i) {
@@ -346,16 +348,75 @@ static int submit_line(const char *raw)
     return 1;
 }
 
-static void handle_client_json(const char *js)
+// ---------------------------------------------------------------- WebSocket login
+
+// With a token set, a WebSocket needs {"t":"auth","token":"..."} before any command (STOP
+// excepted). The session context holds the token generation it logged in with, so a changed
+// or cleared token logs every open page out. httpd frees the context when the socket closes.
+static bool ws_authed(httpd_req_t *req)
+{
+    if (!web_server_token_is_set()) {
+        return true;
+    }
+    const uint32_t *gen = req->sess_ctx;
+    return gen && *gen == web_token_generation();
+}
+
+static void ws_send_auth(int fd, bool ok)
+{
+    jbuf_t b;
+    jb_init(&b, 64);
+    jb_printf(&b, "{\"t\":\"auth\",\"ok\":%s,\"required\":%s}", ok ? "true" : "false",
+              web_server_token_is_set() ? "true" : "false");
+    ws_queue(&b, fd);
+}
+
+static void ws_login(httpd_req_t *req, const char *js)
+{
+    char token[WEB_TOKEN_MAX + 2];  // one more: a too long token must not match when cut
+    const char *v = jin_find(js, "token");
+    bool ok = !web_server_token_is_set() ||
+              (v && jin_string(v, token, sizeof(token)) && web_token_check(token));
+    if (ok && web_server_token_is_set()) {
+        // Reuse the context once allocated: httpd frees a replaced one by itself.
+        uint32_t *gen = req->sess_ctx;
+        if (!gen) {
+            gen = malloc(sizeof(*gen));
+            req->sess_ctx = gen;
+            req->free_ctx = NULL;  // free()
+        }
+        if (gen) {
+            *gen = web_token_generation();
+        } else {
+            ok = false;
+        }
+    }
+    if (!ok) {
+        ESP_LOGW(TAG, "WebSocket fd %d: wrong token", httpd_req_to_sockfd(req));
+    }
+    ws_send_auth(httpd_req_to_sockfd(req), ok);
+}
+
+static void handle_client_json(httpd_req_t *req, const char *js)
 {
     char type[16];
     const char *v = jin_find(js, "t");
     if (!v || !jin_string(v, type, sizeof(type))) {
         return;
     }
-    if (strcmp(type, "stop") == 0) {
+    if (strcmp(type, "stop") == 0) {  // never needs the token: anyone may stop the machine
         printer_state_soft_stop(PRINTER_SRC_WEB);
-    } else if (strcmp(type, "restart") == 0) {
+        return;
+    }
+    if (strcmp(type, "auth") == 0) {
+        ws_login(req, js);
+        return;
+    }
+    if (!ws_authed(req)) {
+        ws_send_auth(httpd_req_to_sockfd(req), false);
+        return;
+    }
+    if (strcmp(type, "restart") == 0) {
         printer_state_restart();
     } else if (strcmp(type, "home_xy") == 0) {
         printer_state_home_xy();  // runs in its own task, can't block the httpd task
@@ -412,7 +473,7 @@ static esp_err_t ws_handler(httpd_req_t *req)
     err = httpd_ws_recv_frame(req, &f, f.len);
     if (err == ESP_OK && f.type == HTTPD_WS_TYPE_TEXT) {
         buf[f.len] = '\0';
-        handle_client_json(buf);
+        handle_client_json(req, buf);
     }
     free(buf);
     return err;
@@ -425,6 +486,30 @@ static esp_err_t send_json(httpd_req_t *req, const char *json)
     httpd_resp_set_type(req, "application/json");
     httpd_resp_set_hdr(req, "Cache-Control", "no-store");
     return httpd_resp_sendstr(req, json);
+}
+
+// REST writes: header "X-Token". Without a token set, open, except when always (OTA), which is
+// then refused. False = a 401 / 403 answer has been sent.
+static bool rest_authed(httpd_req_t *req, bool always)
+{
+    if (!web_server_token_is_set()) {
+        if (always) {
+            httpd_resp_send_err(req, HTTPD_403_FORBIDDEN,
+                                "set an API token first: !token <secret> on the USB console");
+            return false;
+        }
+        return true;
+    }
+    char token[WEB_TOKEN_MAX + 1];
+    size_t len = httpd_req_get_hdr_value_len(req, "X-Token");
+    if (len > 0 && len <= WEB_TOKEN_MAX &&
+        httpd_req_get_hdr_value_str(req, "X-Token", token, sizeof(token)) == ESP_OK &&
+        web_token_check(token)) {
+        return true;
+    }
+    ESP_LOGW(TAG, "%s: missing or wrong X-Token", req->uri);
+    httpd_resp_send_err(req, HTTPD_401_UNAUTHORIZED, "missing or wrong X-Token header");
+    return false;
 }
 
 static esp_err_t api_state_get(httpd_req_t *req)
@@ -467,6 +552,9 @@ static char *read_body(httpd_req_t *req, size_t max)
 
 static esp_err_t api_gcode_post(httpd_req_t *req)
 {
+    if (!rest_authed(req, false)) {
+        return ESP_OK;
+    }
     char *body = read_body(req, MAX_GCODE_BODY);
     if (!body) {
         return ESP_FAIL;
@@ -499,6 +587,9 @@ static esp_err_t api_settings_get(httpd_req_t *req)
 // POST /api/settings {"max_x":180,...}: only the keys given change.
 static esp_err_t api_settings_post(httpd_req_t *req)
 {
+    if (!rest_authed(req, false)) {
+        return ESP_OK;
+    }
     char *body = read_body(req, 1024);
     if (!body) {
         return ESP_FAIL;
@@ -518,6 +609,7 @@ static esp_err_t api_settings_post(httpd_req_t *req)
     return send_json(req, "{\"ok\":true}");
 }
 
+// No token needed: anyone may stop the machine.
 static esp_err_t api_stop_post(httpd_req_t *req)
 {
     printer_state_soft_stop(PRINTER_SRC_WEB);
@@ -526,6 +618,9 @@ static esp_err_t api_stop_post(httpd_req_t *req)
 
 static esp_err_t api_restart_post(httpd_req_t *req)
 {
+    if (!rest_authed(req, false)) {
+        return ESP_OK;
+    }
     printer_state_restart();
     return send_json(req, "{\"ok\":true}");
 }
@@ -536,9 +631,14 @@ static void restart_task(void *arg)
     esp_restart();
 }
 
-// POST /api/ota with the raw app image (build/m200_bridge.bin) as body.
+// POST /api/ota with the raw app image (build/m200_bridge.bin) as body. Always needs the
+// token. The new image boots "pending verify": main.c confirms it once WiFi is back, else the
+// bootloader rolls back to this one (CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE).
 static esp_err_t api_ota_post(httpd_req_t *req)
 {
+    if (!rest_authed(req, true)) {
+        return ESP_FAIL;  // close the socket instead of reading up to 3 MB of refused image
+    }
     const esp_partition_t *part = esp_ota_get_next_update_partition(NULL);
     if (!part) {
         return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "no OTA partition");
@@ -643,6 +743,7 @@ esp_err_t web_server_start(void)
     if (s_server) {
         return ESP_ERR_INVALID_STATE;
     }
+    web_token_load();
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.max_uri_handlers = 14;
     cfg.max_open_sockets = MAX_CLIENTS;

@@ -12,6 +12,7 @@
 #include "esp_system.h"
 #include "printer_link.h"
 #include "printer_state.h"
+#include "web_server.h"
 #include "wifi_link.h"
 
 static const char *TAG = "console";
@@ -73,7 +74,8 @@ static void scan_command(void)
     free(aps);
 }
 
-// "!wifi <ssid> <password>" (ssid in "quotes" if it has spaces), "!wifi clear", "!net", "!scan", "!reboot", "!help"
+// "!wifi <ssid> <password>" (ssid in "quotes" if it has spaces), "!wifi clear", "!net", "!scan",
+// "!token [<secret>|clear]", "!reboot", "!homexy", "!homez", "!help"
 static void bridge_command(const char *cmd)
 {
     if (strcmp(cmd, "wifi clear") == 0) {
@@ -126,6 +128,27 @@ static void bridge_command(const char *cmd)
         }
         printf("printer link %s, %u queued\n", printer_link_state_name(printer_link_get_state()),
                (unsigned)printer_link_queue_len());
+    } else if (strcmp(cmd, "token") == 0) {
+        printf("API token %s\n", web_server_token_is_set()
+                                     ? "set: web control and OTA need it (X-Token header)"
+                                     : "not set: web control is open, OTA is refused");
+    } else if (strcmp(cmd, "token clear") == 0) {
+        esp_err_t err = web_server_set_token(NULL);
+        if (err == ESP_OK) {
+            printf("API token cleared: web control open, OTA refused\n");
+        } else {
+            printf("clear failed: %s\n", esp_err_to_name(err));
+        }
+    } else if (strncmp(cmd, "token ", 6) == 0) {
+        esp_err_t err = web_server_set_token(cmd + 6);
+        if (err == ESP_OK) {
+            printf("API token saved (open web pages must log in again)\n");
+        } else if (err == ESP_ERR_INVALID_ARG) {
+            printf("token must be %d..%d printable characters, no spaces\n", WEB_TOKEN_MIN,
+                   WEB_TOKEN_MAX);
+        } else {
+            printf("save failed: %s\n", esp_err_to_name(err));
+        }
     } else if (strcmp(cmd, "scan") == 0) {
         scan_command();
     } else if (strcmp(cmd, "reboot") == 0) {
@@ -142,6 +165,8 @@ static void bridge_command(const char *cmd)
                "  !wifi clear               forget WiFi and disconnect\n"
                "  !net                      WiFi / printer status\n"
                "  !scan                     list the WiFi networks the ESP32 can see\n"
+               "  !token <secret>           set the web API token (needed for OTA)\n"
+               "  !token / !token clear     show whether one is set / remove it\n"
                "  !reboot                   restart the ESP32\n"
                "  !homexy                   home X Y on their endstops, park at 10 (no G28)\n"
                "  !homez                    home Z on the switch (steps + M119), park at 10\n"

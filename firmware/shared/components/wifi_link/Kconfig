@@ -1,0 +1,19 @@
+menu "WiFi link"
+
+    config WIFI_LINK_HOSTNAME
+        string "Hostname (mDNS name without .local)"
+        default "m200"
+
+    config WIFI_LINK_DEFAULT_SSID
+        string "Default SSID (used only if NVS has none)"
+        default ""
+        help
+            Only for the first boot. It ends up in sdkconfig, which git ignores.
+            Better: set it at runtime from the USB console with  !wifi <ssid> <password>
+            The credentials are then stored in NVS and survive firmware updates.
+
+    config WIFI_LINK_DEFAULT_PASSWORD
+        string "Default password"
+        default ""
+
+endmenu

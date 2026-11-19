@@ -1,6 +1,6 @@
-idf_component_register(SRCS "web_server.c" "json_out.c" "json_in.c"
+idf_component_register(SRCS "web_server.c" "api_token.c" "json_out.c" "json_in.c"
                        INCLUDE_DIRS "include"
-                       PRIV_REQUIRES esp_http_server esp_timer app_update esp_app_format
+                       PRIV_REQUIRES nvs_flash esp_http_server esp_timer app_update esp_app_format
                                      printer_link printer_state wifi_link)
 
 # Embed the web UI (web/bridge-ui at the repo root), gzipped at build time.
