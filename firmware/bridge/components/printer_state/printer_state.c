@@ -494,9 +494,8 @@ void printer_state_dropped(const char *line)
 
 // G28 homes Z with the probe and preheats for it (MINTEMP kill), so the bridge homes each
 // axis with plain moves and reads the switches with M119 (road_Change.md ch. 3):
-//  - X/Y: Marlin does NOT stop a plain move on x_min / y_min, even with M120 (seen on the
-//    printer: the head rammed the frame). So the bridge steps them like Z: 1 mm steps with
-//    M119 after each, back off, then 0.1 mm steps. M120 stays on in case it ever helps.
+//  - X/Y: Marlin stops a plain move on x_min / y_min while M120 is on, so one long move in,
+//    1 mm back, a slow move in, and M119 checks the switch really is pressed.
 //  - Z: Marlin reads its switch (the probe line) only while probing, and G38 isn't built in:
 //    the bridge steps Z and reads M119 after each step, 1 mm back, then 0.1 mm steps.
 // Then G92 sets the switch as 0 (track() marks the axis homed) and the axis parks at
@@ -563,75 +562,29 @@ static int home_switch(int axis)
     return pressed;
 }
 
-// X/Y seek steps. Tested on the printer: Marlin does NOT stop a plain move on x_min / y_min,
-// even with M120, so one long move rams the head into the frame. The bridge steps instead,
-// like Z: a step, M400, M119, until the switch reads pressed. At most one step past it.
-#define XY_SEEK_STEP_MM 1.0f
-#define XY_FINE_STEP_MM 0.1f
-
-// Step X/Y axis i toward its switch (relative moves, G91 already sent) until pressed:
-// 1 pressed, 0 not within max_mm, -1 abort/error.
-static int home_xy_seek(int i, float step, int feed, float max_mm)
-{
-    char fmt[24];
-    snprintf(fmt, sizeof(fmt), "G1 %c%%.3f F%%d", AXES[i]);
-    for (float done = 0; done < max_mm; done += step) {
-        if (!home_sendf(fmt, -step, feed)) {
-            return -1;
-        }
-        int r = home_switch(i);
-        if (r != 0) {
-            return r;
-        }
-    }
-    return 0;
-}
-
-// Back X/Y axis i off its switch: 1 open again, 0 still pressed, -1 abort/error.
-static int home_xy_back_off(int i)
-{
-    char fmt[24];
-    snprintf(fmt, sizeof(fmt), "G1 %c%%.3f F%%d", AXES[i]);
-    if (!home_sendf(fmt, hc[PS_BACKOFF], (int)hc[PS_XY_FAST_F])) {
-        return -1;
-    }
-    int r = home_switch(i);
-    return r < 0 ? -1 : !r;
-}
-
-// One X/Y axis, relative moves (G91 already sent).
+// One X/Y axis, relative moves (G91 already sent), endstop checking on.
 static const char *home_xy_axis(int i)
 {
-    const bool x = i == 0;
-    int r = home_switch(i);
-    if (r == 1) {
-        r = home_xy_back_off(i);  // started on the switch
-        if (r == 0) {
-            return x ? "Error:bridge: X endstop stays pressed (wiring? inverted?)"
-                     : "Error:bridge: Y endstop stays pressed (wiring? inverted?)";
-        }
-    }
-    if (r < 0) {
+    char fmt[24];
+    snprintf(fmt, sizeof(fmt), "G1 %c%%.2f F%%d", AXES[i]);
+    int fast = (int)hc[PS_XY_FAST_F], slow = (int)hc[PS_XY_SLOW_F];
+    if (!home_sendf(fmt, -home_seek_mm(i), fast)) {
         return HOME_FAILED;
     }
-    r = home_xy_seek(i, XY_SEEK_STEP_MM, (int)hc[PS_XY_FAST_F], home_seek_mm(i));
+    int r = home_switch(i);
     if (r <= 0) {
         return r < 0 ? HOME_FAILED
-               : x ? "Error:bridge: X endstop not reached (max X + 30 mm)"
-                   : "Error:bridge: Y endstop not reached (max Y + 30 mm)";
+               : i == 0 ? "Error:bridge: X endstop not reached (max X + 30 mm)"
+                        : "Error:bridge: Y endstop not reached (max Y + 30 mm)";
     }
-    r = home_xy_back_off(i);
-    if (r <= 0) {
-        return r < 0 ? HOME_FAILED
-               : x ? "Error:bridge: X endstop stays pressed after backing off"
-                   : "Error:bridge: Y endstop stays pressed after backing off";
+    if (!home_sendf(fmt, hc[PS_BACKOFF], fast) || !home_sendf(fmt, -2 * hc[PS_BACKOFF], slow)) {
+        return HOME_FAILED;
     }
-    r = home_xy_seek(i, XY_FINE_STEP_MM, (int)hc[PS_XY_SLOW_F],
-                     hc[PS_BACKOFF] + 2 * XY_SEEK_STEP_MM);
+    r = home_switch(i);
     if (r <= 0) {
         return r < 0 ? HOME_FAILED
-               : x ? "Error:bridge: X endstop not found again on the slow pass"
-                   : "Error:bridge: Y endstop not found again on the slow pass";
+               : i == 0 ? "Error:bridge: X endstop not found again on the slow pass"
+                        : "Error:bridge: Y endstop not found again on the slow pass";
     }
     return NULL;
 }

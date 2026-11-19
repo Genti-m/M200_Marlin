@@ -115,8 +115,7 @@ bool printer_state_allow(const char *line, printer_source_t source);
 void printer_state_dropped(const char *line);
 
 // Homing without G28 (it preheats for the Z probe: MINTEMP kill), each in its own task.
-// X Y: 1 mm steps toward the min endstop with M119 after each (Marlin doesn't stop a plain move
-// on these switches, even with M120), back off, then 0.1 mm steps.
+// X Y: fast to the min endstop with M120 on, 1 mm back, slow in, M119 must show it pressed.
 // Z: steps toward the switch on the probe line (0.5 mm), reading M119 after each step, 1 mm
 // back, then 0.1 mm steps. Then G92 sets the switch as 0 and the axis parks at 10 mm.
 // (The numbers are the default settings.)
