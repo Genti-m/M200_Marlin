@@ -11,6 +11,7 @@
 #include "freertos/task.h"
 #include "esp_system.h"
 #include "printer_link.h"
+#include "printer_state.h"
 #include "wifi_link.h"
 
 static const char *TAG = "console";
@@ -131,6 +132,10 @@ static void bridge_command(const char *cmd)
         printf("rebooting\n");
         vTaskDelay(pdMS_TO_TICKS(100));
         esp_restart();
+    } else if (strcmp(cmd, "homexy") == 0) {
+        printer_state_home_xy();  // progress and result come as "bridge:" lines
+    } else if (strcmp(cmd, "homez") == 0) {
+        printer_state_home_z();
     } else {
         printf("bridge commands:\n"
                "  !wifi <ssid> <password>   save WiFi in NVS and connect\n"
@@ -138,6 +143,8 @@ static void bridge_command(const char *cmd)
                "  !net                      WiFi / printer status\n"
                "  !scan                     list the WiFi networks the ESP32 can see\n"
                "  !reboot                   restart the ESP32\n"
+               "  !homexy                   home X Y on their endstops, park at 10 (no G28)\n"
+               "  !homez                    home Z on the switch (steps + M119), park at 10\n"
                "anything else goes to the printer as G-code\n");
     }
 }
@@ -150,8 +157,11 @@ static void submit(const char *line)
     }
     if (printer_is_emergency_command(line)) {
         printer_emergency(line, PRINTER_SRC_CONSOLE);
+    } else if (!printer_state_allow(line, PRINTER_SRC_CONSOLE)) {
+        return;  // the reason is printed as an "Error:bridge:" line
     } else if (printer_send(line, PRINTER_SRC_CONSOLE, pdMS_TO_TICKS(100)) != ESP_OK) {
         ESP_LOGW(TAG, "queue full, dropped: %s", line);
+        printer_state_dropped(line);
     }
 }
 

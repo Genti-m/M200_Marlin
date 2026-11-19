@@ -3,6 +3,7 @@
 #include <ctype.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 
 #include "esp_app_desc.h"
 #include "esp_http_server.h"
@@ -81,8 +82,25 @@ static void jb_state(jbuf_t *b, bool with_type)
     jb_temp(b, &s.nozzle);
     jb_puts(b, ",\"bed\":");
     jb_temp(b, &s.bed);
-    jb_printf(b, ",\"busy\":%s,\"homed\":%s,\"pos\":", s.busy ? "true" : "false",
-              s.homed ? "true" : "false");
+#define JB_BOOL(v) ((v) ? "true" : "false")
+    jb_printf(b, ",\"busy\":%s,\"homing\":%s,\"stopped\":%s,\"halted\":%s", JB_BOOL(s.busy),
+              JB_BOOL(s.homing), JB_BOOL(s.stopped), JB_BOOL(s.halted));
+    jb_printf(b, ",\"homed\":[%s,%s,%s],\"mpos\":[", JB_BOOL(s.homed[0]), JB_BOOL(s.homed[1]),
+              JB_BOOL(s.homed[2]));
+    for (int i = 0; i < 3; i++) {  // machine position (0 = switch) and offset, homed axes only
+        if (s.homed[i]) {
+            jb_printf(b, "%s%.2f", i ? "," : "", (double)s.mpos[i]);
+        } else {
+            jb_printf(b, "%snull", i ? "," : "");
+        }
+    }
+    jb_printf(b, "],\"zero\":[%.2f,%.2f,%.2f],\"dir\":[%g,%g,%g],\"max\":[%g,%g,%g]",
+              (double)s.zero[0], (double)s.zero[1], (double)s.zero[2], (double)s.dir[0],
+              (double)s.dir[1], (double)s.dir[2], (double)s.max_mm[0], (double)s.max_mm[1],
+              (double)s.max_mm[2]);
+#undef JB_BOOL
+    jb_printf(b, ",\"unplugged\":{\"nozzle\":%s,\"bed\":%s},\"pos\":",
+              s.nozzle_unplugged ? "true" : "false", s.bed_unplugged ? "true" : "false");
     if (s.pos_valid) {
         jb_printf(b, "[%.2f,%.2f,%.2f]", (double)s.pos[0], (double)s.pos[1], (double)s.pos[2]);
     } else {
@@ -95,6 +113,44 @@ static void jb_state(jbuf_t *b, bool with_type)
         jb_puts(b, ",\"rssi\":null");
     }
     jb_printf(b, ",\"queue\":%u}", (unsigned)s.queue);
+}
+
+// {"t":"settings","v":{"max_x":170,...},"d":{"max_x":[default,min,max,step],...}}
+static void jb_settings(jbuf_t *b, bool with_type)
+{
+    float v[PS_COUNT];
+    printer_state_get_settings(v);
+    jb_puts(b, with_type ? "{\"t\":\"settings\",\"v\":{" : "{\"v\":{");
+    for (int i = 0; i < PS_COUNT; i++) {
+        jb_printf(b, "%s\"%s\":%g", i ? "," : "", printer_setting_desc(i)->key, (double)v[i]);
+    }
+    jb_puts(b, "},\"d\":{");
+    for (int i = 0; i < PS_COUNT; i++) {
+        const printer_setting_desc_t *d = printer_setting_desc(i);
+        jb_printf(b, "%s\"%s\":[%g,%g,%g,%g]", i ? "," : "", d->key, (double)d->def,
+                  (double)d->min, (double)d->max, (double)d->step);
+    }
+    jb_puts(b, "}}");
+}
+
+// Settings from a flat JSON object ({"max_x":180,"park":10}): keys left out keep their value.
+static const char *apply_settings(const char *js)
+{
+    float v[PS_COUNT];
+    printer_state_get_settings(v);
+    for (int i = 0; i < PS_COUNT; i++) {
+        const char *p = jin_find(js, printer_setting_desc(i)->key);
+        if (!p) {
+            continue;
+        }
+        char *end;
+        float f = strtof(p, &end);
+        if (end == p) {
+            return "Error:bridge: settings: not a number";
+        }
+        v[i] = f;
+    }
+    return printer_state_set_settings(v);
 }
 
 static void jb_line(jbuf_t *b, bool tx, printer_source_t src, const char *text)
@@ -236,6 +292,12 @@ static void hello_work(void *arg)
         ESP_LOGW(TAG, "no memory for hello");
     }
     jb_free(&b);
+    jb_init(&b, 1024);
+    jb_settings(&b, true);
+    if (!b.oom) {
+        ws_send_fd(fd, b.buf, b.len);
+    }
+    jb_free(&b);
     jb_init(&b, 256);
     jb_state(&b, true);
     if (!b.oom) {
@@ -246,7 +308,9 @@ static void hello_work(void *arg)
 
 // ---------------------------------------------------------------- commands from clients
 
-static bool submit_line(const char *raw)
+// 1 queued, 0 empty / refused / emergency, -1 dropped: queue full, the caller stops the batch
+// (a jog without its G91 would run as an absolute move).
+static int submit_line(const char *raw)
 {
     char line[USER_LINE_MAX + 1];
     while (*raw == ' ' || *raw == '\t') {
@@ -265,14 +329,21 @@ static bool submit_line(const char *raw)
     }
     memcpy(line, raw, n);
     line[n] = '\0';
+    if (strncasecmp(line, "M112", 4) == 0 && (line[4] == '\0' || line[4] == ' ')) {
+        return printer_state_soft_stop(PRINTER_SRC_WEB) == ESP_OK;  // same as the STOP button
+    }
     if (printer_is_emergency_command(line)) {
         return printer_emergency(line, PRINTER_SRC_WEB) == ESP_OK;
     }
-    if (printer_send(line, PRINTER_SRC_WEB, pdMS_TO_TICKS(200)) != ESP_OK) {
-        ESP_LOGW(TAG, "printer queue full, dropped: %s", line);
+    if (!printer_state_allow(line, PRINTER_SRC_WEB)) {
         return false;
     }
-    return true;
+    if (printer_send(line, PRINTER_SRC_WEB, pdMS_TO_TICKS(200)) != ESP_OK) {
+        ESP_LOGW(TAG, "printer queue full, dropped: %s", line);
+        printer_state_dropped(line);
+        return -1;
+    }
+    return 1;
 }
 
 static void handle_client_json(const char *js)
@@ -283,7 +354,15 @@ static void handle_client_json(const char *js)
         return;
     }
     if (strcmp(type, "stop") == 0) {
-        printer_emergency("M112", PRINTER_SRC_WEB);
+        printer_state_soft_stop(PRINTER_SRC_WEB);
+    } else if (strcmp(type, "restart") == 0) {
+        printer_state_restart();
+    } else if (strcmp(type, "home_xy") == 0) {
+        printer_state_home_xy();  // runs in its own task, can't block the httpd task
+    } else if (strcmp(type, "home_z") == 0) {
+        printer_state_home_z();
+    } else if (strcmp(type, "settings_set") == 0) {
+        apply_settings(js);  // the answer is a "settings" message, or an Error:bridge: line
     } else if (strcmp(type, "gcode") == 0) {
         const char *p = jin_find(js, "lines");
         if (!p || *p != '[') {
@@ -296,7 +375,9 @@ static void handle_client_json(const char *js)
             if (!p) {
                 return;
             }
-            submit_line(line);
+            if (submit_line(line) < 0) {
+                return;
+            }
             p = jin_ws(p);
             if (*p != ',') {
                 break;
@@ -393,7 +474,11 @@ static esp_err_t api_gcode_post(httpd_req_t *req)
     int queued = 0;
     char *save = NULL;
     for (char *l = strtok_r(body, "\n", &save); l; l = strtok_r(NULL, "\n", &save)) {
-        queued += submit_line(l);
+        int r = submit_line(l);
+        if (r < 0) {
+            break;
+        }
+        queued += r;
     }
     free(body);
     char out[32];
@@ -401,9 +486,47 @@ static esp_err_t api_gcode_post(httpd_req_t *req)
     return send_json(req, out);
 }
 
+static esp_err_t api_settings_get(httpd_req_t *req)
+{
+    jbuf_t b;
+    jb_init(&b, 1024);
+    jb_settings(&b, false);
+    esp_err_t err = b.oom ? httpd_resp_send_500(req) : send_json(req, b.buf);
+    jb_free(&b);
+    return err;
+}
+
+// POST /api/settings {"max_x":180,...}: only the keys given change.
+static esp_err_t api_settings_post(httpd_req_t *req)
+{
+    char *body = read_body(req, 1024);
+    if (!body) {
+        return ESP_FAIL;
+    }
+    const char *why = apply_settings(body);
+    free(body);
+    if (why) {
+        jbuf_t b;
+        jb_init(&b, 128);
+        jb_puts(&b, "{\"ok\":false,\"error\":");
+        jb_str(&b, why);
+        jb_puts(&b, "}");
+        esp_err_t err = b.oom ? httpd_resp_send_500(req) : send_json(req, b.buf);
+        jb_free(&b);
+        return err;
+    }
+    return send_json(req, "{\"ok\":true}");
+}
+
 static esp_err_t api_stop_post(httpd_req_t *req)
 {
-    printer_emergency("M112", PRINTER_SRC_WEB);
+    printer_state_soft_stop(PRINTER_SRC_WEB);
+    return send_json(req, "{\"ok\":true}");
+}
+
+static esp_err_t api_restart_post(httpd_req_t *req)
+{
+    printer_state_restart();
     return send_json(req, "{\"ok\":true}");
 }
 
@@ -497,6 +620,13 @@ static void broadcast_state(void)
 
 static void on_state_event(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
+    if (id == PRINTER_STATE_EVENT_SETTINGS) {
+        jbuf_t b;
+        jb_init(&b, 1024);
+        jb_settings(&b, true);
+        ws_queue(&b, -1);
+        return;
+    }
     broadcast_state();
 }
 
@@ -514,7 +644,7 @@ esp_err_t web_server_start(void)
         return ESP_ERR_INVALID_STATE;
     }
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
-    cfg.max_uri_handlers = 12;
+    cfg.max_uri_handlers = 14;
     cfg.max_open_sockets = MAX_CLIENTS;
     cfg.lru_purge_enable = true;
     cfg.stack_size = 8192;
@@ -534,7 +664,10 @@ esp_err_t web_server_start(void)
         {.uri = "/ws", .method = HTTP_GET, .handler = ws_handler, .is_websocket = true},
         {.uri = "/api/state", .method = HTTP_GET, .handler = api_state_get},
         {.uri = "/api/gcode", .method = HTTP_POST, .handler = api_gcode_post},
+        {.uri = "/api/settings", .method = HTTP_GET, .handler = api_settings_get},
+        {.uri = "/api/settings", .method = HTTP_POST, .handler = api_settings_post},
         {.uri = "/api/stop", .method = HTTP_POST, .handler = api_stop_post},
+        {.uri = "/api/restart", .method = HTTP_POST, .handler = api_restart_post},
         {.uri = "/api/ota", .method = HTTP_POST, .handler = api_ota_post},
     };
     for (size_t i = 0; i < sizeof(uris) / sizeof(uris[0]); i++) {
@@ -542,7 +675,7 @@ esp_err_t web_server_start(void)
     }
 
     ESP_ERROR_CHECK(esp_event_handler_register(PRINTER_EVENT, ESP_EVENT_ANY_ID, on_printer_event, NULL));
-    ESP_ERROR_CHECK(esp_event_handler_register(PRINTER_STATE_EVENT, PRINTER_STATE_EVENT_CHANGED,
+    ESP_ERROR_CHECK(esp_event_handler_register(PRINTER_STATE_EVENT, ESP_EVENT_ANY_ID,
                                                on_state_event, NULL));
     const esp_timer_create_args_t targs = {.callback = state_timer_cb, .name = "web_state"};
     esp_timer_handle_t timer;
