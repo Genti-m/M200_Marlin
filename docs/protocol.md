@@ -96,6 +96,9 @@ The API token lives in the bridge's NVS and is set on the USB console: `!token <
   `{"t":"auth","ok":false,"required":true}` and do nothing. The web page asks once and keeps
   the token in the browser (`localStorage`). Changing or clearing the token logs every open
   page out.
+- **Origin check**: a browser request whose `Origin` isn't the bridge itself (`http://<Host>`)
+  is refused: WebSocket closed at connect, REST 403. So another web page open in the same
+  browser can't drive the machine, token or not. Requests without `Origin` (curl) pass.
 - **Always open**: `stop` / `POST /api/stop` (anyone may stop the machine), and reading:
   `hello`, `state`, `line`, `settings`, `GET /api/*`, the UI files.
 

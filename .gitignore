@@ -1,7 +1,7 @@
 # ESP-IDF build output
 build/
 managed_components/
-dependencies.lock
+# dependencies.lock is committed: it pins the managed components (mdns) for every build
 sdkconfig
 sdkconfig.old
 # keep sdkconfig.defaults (tracked)

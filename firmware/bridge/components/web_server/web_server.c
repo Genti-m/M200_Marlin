@@ -30,6 +30,8 @@ static const char *TAG = "web_server";
 
 static httpd_handle_t s_server;
 
+static bool origin_ok(httpd_req_t *req);
+
 // ---------------------------------------------------------------- embedded UI
 
 #define ASSET(sym) \
@@ -451,6 +453,9 @@ static void handle_client_json(httpd_req_t *req, const char *js)
 static esp_err_t ws_handler(httpd_req_t *req)
 {
     if (req->method == HTTP_GET) {  // handshake done
+        if (!origin_ok(req)) {
+            return ESP_FAIL;  // closes the socket: a foreign page gets no WebSocket
+        }
         int fd = httpd_req_to_sockfd(req);
         ESP_LOGI(TAG, "WebSocket client fd %d", fd);
         httpd_queue_work(s_server, hello_work, (void *)(intptr_t)fd);
@@ -488,10 +493,45 @@ static esp_err_t send_json(httpd_req_t *req, const char *json)
     return httpd_resp_sendstr(req, json);
 }
 
+// Browsers send "Origin" with every WebSocket and every cross-site POST. Only our own page
+// (Origin host == Host) may drive the machine: a foreign web page open in the same browser
+// can't, even with no token set. No Origin (curl, scripts): allowed, the token covers those.
+static bool origin_ok(httpd_req_t *req)
+{
+    char origin[96], host[64];
+    size_t olen = httpd_req_get_hdr_value_len(req, "Origin");
+    if (olen == 0) {
+        return true;
+    }
+    if (olen >= sizeof(origin) ||
+        httpd_req_get_hdr_value_str(req, "Origin", origin, sizeof(origin)) != ESP_OK ||
+        httpd_req_get_hdr_value_len(req, "Host") >= sizeof(host) ||
+        httpd_req_get_hdr_value_str(req, "Host", host, sizeof(host)) != ESP_OK) {
+        return false;
+    }
+    const char *o = origin;
+    if (strncasecmp(o, "http://", 7) == 0) {
+        o += 7;
+    } else if (strncasecmp(o, "https://", 8) == 0) {
+        o += 8;
+    } else {
+        return false;  // "null" (file:// pages, sandboxed frames) and anything odd
+    }
+    if (strcasecmp(o, host) == 0) {
+        return true;
+    }
+    ESP_LOGW(TAG, "%s: refused, Origin \"%s\" is not this bridge (\"%s\")", req->uri, origin, host);
+    return false;
+}
+
 // REST writes: header "X-Token". Without a token set, open, except when always (OTA), which is
 // then refused. False = a 401 / 403 answer has been sent.
 static bool rest_authed(httpd_req_t *req, bool always)
 {
+    if (!origin_ok(req)) {
+        httpd_resp_send_err(req, HTTPD_403_FORBIDDEN, "foreign Origin");
+        return false;
+    }
     if (!web_server_token_is_set()) {
         if (always) {
             httpd_resp_send_err(req, HTTPD_403_FORBIDDEN,
@@ -609,9 +649,12 @@ static esp_err_t api_settings_post(httpd_req_t *req)
     return send_json(req, "{\"ok\":true}");
 }
 
-// No token needed: anyone may stop the machine.
+// No token needed: anyone may stop the machine (but not a foreign web page).
 static esp_err_t api_stop_post(httpd_req_t *req)
 {
+    if (!origin_ok(req)) {
+        return httpd_resp_send_err(req, HTTPD_403_FORBIDDEN, "foreign Origin");
+    }
     printer_state_soft_stop(PRINTER_SRC_WEB);
     return send_json(req, "{\"ok\":true}");
 }

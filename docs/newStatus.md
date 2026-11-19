@@ -89,6 +89,32 @@ tools/run_host_tests.sh          PC unit tests (also run by .github/workflows/ci
 
 UI changes without the printer: `python tools/mock_bridge.py` -> http://localhost:8080 (same protocol, fake Marlin).
 
+## Hardware test checklist (road_Change.md ch. 5-7: built, not flashed yet)
+
+Tick each one on the printer, in this order. Printer on, nothing on the bed.
+
+**Flash (USB, once)**
+- [ ] Delete `firmware/bridge/sdkconfig`, Build, Flash over USB (COM7). Boot log shows the new version, no errors
+- [ ] `!net`: WiFi connected. `http://m200.local` loads, the icons show, the dots go green
+
+**Token and OTA**
+- [ ] `!token <secret>` (8..64 chars). The open page asks for it on the next command; a wrong one is refused
+- [ ] STOP works on a page that is *not* logged in
+- [ ] `curl -X POST http://m200.local/api/ota` without `X-Token` -> 401
+- [ ] OTA with the token -> reboots, log shows `new firmware confirmed (WiFi up)`
+- [ ] Rollback: build a test image with `vTaskDelay(pdMS_TO_TICKS(5000)); abort();` at the end of
+      `app_main`, OTA it. It crashes before WiFi confirms it, and the board must boot the previous
+      image by itself. (WiFi credentials live in NVS and survive OTA, so "no WiFi" is harder to fake.)
+
+**Homing and limits**
+- [ ] `M119` with nothing pressed: all `open`. Press each switch by hand: `TRIGGERED`
+- [ ] Home XY: X then Y move *toward* their switches, stop, back off, park at 10/10
+- [ ] Home Z: steps toward the switch (check `z_dir`; wrong way -> STOP, flip it in Setting tweaking)
+- [ ] Jog 10 mm each way; a jog past 170 is refused with an `Error:bridge:` line
+- [ ] A plain move into an endstop with `M120` on stops there, and Marlin keeps answering
+- [ ] `G28`, `M104 S200`, `M104S200`, `N5G28` from the console: all refused
+- [ ] STOP during a Z home: home aborts, `RESTART` needed, axes unhomed
+
 ## Open points (small)
 - ~~`Hardcoded Default Settings Loaded`: try `M500`~~ -> `Cap:EEPROM:0`, this build can't save settings (see `marlin_caps.md`).
 - `Cap:EMERGENCY_PARSER:0`: STOP (`M112`) only runs after the current command. Marlin 2.x sends busy as `echo:busy: processing`; `marlin_proto` now treats that as BUSY (it was ECHO, so the `ok` timeout never restarted). Confirm during a real `G28`.

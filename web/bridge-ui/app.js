@@ -218,7 +218,7 @@ function updateJog() {
     : s.stopped ? "Stopped: press RESTART"
     : s.homing ? "Homing..."
     : freeMove.checked && !all ? "Not homed axes: no limits, watch the head"
-    : all ? "" : "Home X Y (⌂) and Z (⌂Z) to move";
+    : all ? "" : "Home XY and Z (house buttons) to move";
 }
 
 document.querySelectorAll("[data-jog]").forEach((b) => b.addEventListener("click", () => {
@@ -307,6 +307,8 @@ function updatePresets() {
 // ---------- STOP: tap, then tap again within 3 s. After it: RESTART ----------
 // STOP is a soft stop (M410, fan off, motors off): Marlin keeps running.
 const stopBtn = $("#stop");
+const stopLabel = $("#stop-label");
+const stopIcon = $("#stop-icon");
 let armTimer = 0;
 const stopMode = () => (state.halted ? "halted" : state.stopped ? "restart" : "stop");
 
@@ -316,7 +318,8 @@ function showStopMode() {
   if (stopBtn.classList.contains("arm")) return;
   stopBtn.classList.toggle("restart", mode === "restart");
   stopBtn.classList.toggle("halted", mode === "halted");
-  stopBtn.textContent = mode === "halted" ? "HALTED" : mode === "restart" ? "RESTART" : "STOP";
+  stopLabel.textContent = mode === "halted" ? "HALTED" : mode === "restart" ? "RESTART" : "STOP";
+  stopIcon.setAttribute("href", mode === "halted" ? "#i-alert" : mode === "restart" ? "#i-play" : "#i-stop");
   stopBtn.title = mode === "halted" ? "Marlin called kill(): power-cycle the printer"
     : mode === "restart" ? "Allow commands again (home before moving)"
     : "Stop: abort moves and homing, fan off, motors off";
@@ -334,7 +337,7 @@ stopBtn.addEventListener("click", () => {
   }
   if (!stopBtn.classList.contains("arm")) {
     stopBtn.classList.add("arm");
-    stopBtn.textContent = "CONFIRM STOP";
+    stopLabel.textContent = "CONFIRM STOP";
     armTimer = setTimeout(() => { disarm(); showStopMode(); }, 3000);
     return;
   }

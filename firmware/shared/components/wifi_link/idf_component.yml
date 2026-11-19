@@ -1,2 +1,3 @@
 dependencies:
-  espressif/mdns: "*"
+  # pinned: the build used 1.15.1. A new major only on purpose (see dependencies.lock)
+  espressif/mdns: "^1.15.1"
