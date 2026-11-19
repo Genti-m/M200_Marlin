@@ -450,15 +450,33 @@ static void handle_client_json(httpd_req_t *req, const char *js)
     }
 }
 
+// Since ESP-IDF 6 the WebSocket handler is no longer called for the handshake GET: these two
+// hooks (CONFIG_HTTPD_WS_PRE/POST_HANDSHAKE_CB_SUPPORT, sdkconfig.defaults) take its place.
+#if !CONFIG_HTTPD_WS_PRE_HANDSHAKE_CB_SUPPORT || !CONFIG_HTTPD_WS_POST_HANDSHAKE_CB_SUPPORT
+#error "enable CONFIG_HTTPD_WS_PRE_HANDSHAKE_CB_SUPPORT and _POST_ (see sdkconfig.defaults)"
+#endif
+
+// Before the switch to WebSocket: a foreign page gets a 403, never a socket.
+static esp_err_t ws_pre_handshake(httpd_req_t *req)
+{
+    if (!origin_ok(req)) {
+        httpd_resp_send_err(req, HTTPD_403_FORBIDDEN, "foreign Origin");
+        return ESP_FAIL;
+    }
+    return ESP_OK;
+}
+
+// After the switch: send the hello (history, settings, state) from the httpd task.
+static esp_err_t ws_post_handshake(httpd_req_t *req)
+{
+    int fd = httpd_req_to_sockfd(req);
+    ESP_LOGI(TAG, "WebSocket client fd %d", fd);
+    return httpd_queue_work(s_server, hello_work, (void *)(intptr_t)fd);
+}
+
 static esp_err_t ws_handler(httpd_req_t *req)
 {
-    if (req->method == HTTP_GET) {  // handshake done
-        if (!origin_ok(req)) {
-            return ESP_FAIL;  // closes the socket: a foreign page gets no WebSocket
-        }
-        int fd = httpd_req_to_sockfd(req);
-        ESP_LOGI(TAG, "WebSocket client fd %d", fd);
-        httpd_queue_work(s_server, hello_work, (void *)(intptr_t)fd);
+    if (req->method == HTTP_GET) {  // not called for the handshake any more (see above)
         return ESP_OK;
     }
     httpd_ws_frame_t f = {.type = HTTPD_WS_TYPE_TEXT};
@@ -805,7 +823,8 @@ esp_err_t web_server_start(void)
         {.uri = "/index.html", .method = HTTP_GET, .handler = asset_get, .user_ctx = (void *)&s_index},
         {.uri = "/style.css", .method = HTTP_GET, .handler = asset_get, .user_ctx = (void *)&s_css},
         {.uri = "/app.js", .method = HTTP_GET, .handler = asset_get, .user_ctx = (void *)&s_js},
-        {.uri = "/ws", .method = HTTP_GET, .handler = ws_handler, .is_websocket = true},
+        {.uri = "/ws", .method = HTTP_GET, .handler = ws_handler, .is_websocket = true,
+         .ws_pre_handshake_cb = ws_pre_handshake, .ws_post_handshake_cb = ws_post_handshake},
         {.uri = "/api/state", .method = HTTP_GET, .handler = api_state_get},
         {.uri = "/api/gcode", .method = HTTP_POST, .handler = api_gcode_post},
         {.uri = "/api/settings", .method = HTTP_GET, .handler = api_settings_get},
