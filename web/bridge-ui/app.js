@@ -302,6 +302,35 @@ function updatePresets() {
     ? (m[0] != null ? `head at X ${m[0].toFixed(1)}  Y ${m[1].toFixed(1)} mm from the switches` : "")
     : "Home X Y first";
   $("#preset-range").textContent = `X Y, % of 0..${maxMm(0)} × 0..${maxMm(1)} mm`;
+  updateLive();
+}
+
+// ---------- Live position: the head in a frame like the presets ----------
+// Real position: the last M114 (sent after every jog, preset and home), as the machine position
+// (0 = switch): dir * (logical - zero). Before the first M114, the bridge's tracked one.
+function realPos(i) {
+  if (!homed(i)) return null;
+  const p = state.pos, zero = state.zero || [0, 0, 0];
+  if (p && p[i] != null) return dirOf(i) * (p[i] - zero[i]);
+  return state.mpos ? state.mpos[i] : null;
+}
+const clampPct = (v, max) => Math.min(100, Math.max(0, (v / max) * 100));
+function updateLive() {
+  const x = realPos(0), y = realPos(1), z = realPos(2);
+  const xy = x != null && y != null;
+  $("#live").classList.toggle("off", !xy);
+  $("#live-xy").style.aspectRatio = `${maxMm(0)} / ${maxMm(1)}`;
+  const dot = $("#live-dot");
+  dot.classList.toggle("hidden", !xy);
+  if (xy) {
+    dot.style.left = clampPct(x, maxMm(0)) + "%";
+    dot.style.bottom = clampPct(y, maxMm(1)) + "%";
+  }
+  $("#live-lbl").textContent = xy ? `X ${x.toFixed(1)} · Y ${y.toFixed(1)}` : "Home X Y to see the head";
+  const zm = $("#live-zmark");
+  zm.classList.toggle("hidden", z == null);
+  if (z != null) zm.style.bottom = clampPct(z, maxMm(2)) + "%";
+  $("#live-z").title = z == null ? "Z: home Z to see it" : `Z ${z.toFixed(1)} mm from the switch`;
 }
 
 // ---------- STOP: tap, then tap again within 3 s. After it: RESTART ----------

@@ -85,6 +85,9 @@ Target 0 (`M104 S0`, `M140 S0`) still passes. Soft STOP sends it, and it is harm
 
 - The heating parts are gone: the hotend and bed cards, the temperature chart, and `M105`.
 - **Position**: an X / Y / Z badge per axis, green when homed by the bridge.
+  Below the numbers, a live frame like the presets: a green dot at the real X Y position and a
+  Z gauge, both from the last `M114` (sent after every jog, preset and home), in mm from the
+  switches. Refresh is a small icon at the top right of the card.
 - **Move**: ⌂ homes X Y, ⌂Z homes Z. Each jog button works once its axis is homed (or with
   "move without homing"), and jogs stop at the 0..170 limits.
 - **Presets**: nine little frames of the XY plane, X and Y at 10 / 50 / 90 % of 0..170 mm.

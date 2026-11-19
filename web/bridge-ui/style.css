@@ -98,6 +98,31 @@ h2 .ic { width: 16px; height: 16px; margin-right: -2px; }
 .xyz span { font-size: 24px; font-variant-numeric: tabular-nums; }
 .xyz small { color: var(--muted); }
 .row { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+/* Small icon-only button at the right end of a card title */
+.icon-btn {
+  margin-left: auto; width: 30px; height: 30px; padding: 0; border-radius: 8px;
+  background: none; border-color: transparent; color: var(--muted);
+}
+.icon-btn:hover:not(:disabled) { color: var(--text); background: var(--btn); }
+.icon-btn .ic { width: 16px; height: 16px; }
+/* Live position: an XY frame like the presets, plus a Z gauge. Dot = last M114. */
+.live { display: flex; gap: 8px; max-width: 340px; margin: 0 auto 10px; }  /* not huge on phones */
+.live-xy { flex: 1; aspect-ratio: 1; cursor: default; }
+.live .live-xy .dot-at {  /* beats ".frame .dot-at" (presets) further down */
+  background: var(--ok); box-shadow: 0 0 0 4px color-mix(in srgb, var(--ok) 25%, transparent);
+  transition: left .35s ease, bottom .35s ease;
+}
+.live-z {
+  position: relative; width: 18px; background: var(--log-bg); border: 1px solid var(--line);
+  border-radius: 8px;
+}
+.live-z i {
+  position: absolute; left: 2px; right: 2px; height: 4px; margin-bottom: -2px; border-radius: 2px;
+  background: var(--ok); transition: bottom .35s ease;
+}
+.live-z small { position: absolute; top: 4px; left: 0; right: 0; text-align: center; font-size: 10px; color: var(--muted); }
+.live .hidden { display: none; }
+.live.off .live-xy { opacity: .6; }
 
 /* Jog pad (4b) */
 .pad {

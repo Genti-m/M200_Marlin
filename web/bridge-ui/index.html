@@ -50,13 +50,21 @@
       <span class="badges" title="Homed by the bridge: 0 = the switch, limits in Setting tweaking">
         <span class="badge" id="homed-x">X</span><span class="badge" id="homed-y">Y</span><span class="badge" id="homed-z">Z</span>
       </span>
+      <button type="button" id="pos-refresh" class="icon-btn" title="Refresh the position (M114)" aria-label="Refresh the position"><svg class="ic"><use href="#i-refresh"/></svg></button>
     </h2>
     <div class="xyz">
       <div><small>X</small><span id="pos-x">--</span></div>
       <div><small>Y</small><span id="pos-y">--</span></div>
       <div><small>Z</small><span id="pos-z">--</span></div>
     </div>
-    <div class="row"><span class="muted" id="busy"></span><button type="button" id="pos-refresh"><svg class="ic"><use href="#i-refresh"/></svg>Refresh</button></div>
+    <!-- The real head position (last M114, sent after every jog / preset / home), like a preset frame -->
+    <div class="live off" id="live">
+      <div class="frame live-xy" id="live-xy" title="X Y from the last M114: 0 = the switches">
+        <span class="dot-at" id="live-dot"></span><span class="lbl" id="live-lbl">Home X Y to see the head</span>
+      </div>
+      <div class="live-z" id="live-z" title="Z from the last M114: 0 = the switch"><i id="live-zmark"></i><small>Z</small></div>
+    </div>
+    <div class="row"><span class="muted" id="busy"></span></div>
   </section>
 
   <section class="card jog">
