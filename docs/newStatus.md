@@ -109,8 +109,7 @@ Tick each one on the printer, in this order. Printer on, nothing on the bed.
 **Homing and limits**
 - [ ] `M119` with nothing pressed: all `open`. Press each switch by hand: `TRIGGERED`
 - [ ] Home XY: X then Y step *toward* their switches (1 mm steps + `M119`), stop at most 1 mm past, back off, park at 10/10
-- [ ] X/Y endstops plugged in, and `M119` shows `TRIGGERED` with each switch held by hand. Hand on the power switch for the first Home (road_Change ch. 8)
-- [ ] With the switches in: does a slow jog with `M120` on stop at the switch? (tells whether unhomed jogs are protected)
+- [ ] Hand on the power switch for the first Home: Marlin ignores the X/Y endstops on plain moves (road_Change ch. 8)
 - [ ] Home Z: steps toward the switch (check `z_dir`; wrong way -> STOP, flip it in Setting tweaking)
 - [ ] Jog 10 mm each way; a jog past 170 is refused with an `Error:bridge:` line
 - [ ] A plain move into an endstop with `M120` on stops there, and Marlin keeps answering

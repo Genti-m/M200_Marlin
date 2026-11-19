@@ -494,10 +494,9 @@ void printer_state_dropped(const char *line)
 
 // G28 homes Z with the probe and preheats for it (MINTEMP kill), so the bridge homes each
 // axis with plain moves and reads the switches with M119 (road_Change.md ch. 3):
-//  - X/Y: stepped like Z (1 mm steps with M119 after each, back off, then 0.1 mm steps), so
-//    the home doesn't depend on Marlin stopping a plain move at the switch with M120. That is
-//    untested: the first home rammed the frame, but the endstops weren't plugged in then.
-//    M120 is still sent.
+//  - X/Y: Marlin does NOT stop a plain move on x_min / y_min, even with M120 (seen on the
+//    printer: the head rammed the frame). So the bridge steps them like Z: 1 mm steps with
+//    M119 after each, back off, then 0.1 mm steps. M120 stays on in case it ever helps.
 //  - Z: Marlin reads its switch (the probe line) only while probing, and G38 isn't built in:
 //    the bridge steps Z and reads M119 after each step, 1 mm back, then 0.1 mm steps.
 // Then G92 sets the switch as 0 (track() marks the axis homed) and the axis parks at
@@ -564,9 +563,9 @@ static int home_switch(int axis)
     return pressed;
 }
 
-// X/Y seek steps: a step, M400, M119, until the switch reads pressed, so the head goes at most
-// one step past it whether or not Marlin stops a move on the endstop (M120). It can't catch an
-// unplugged switch (reads open): check M119 by hand first (road_Change.md ch. 8).
+// X/Y seek steps. Tested on the printer: Marlin does NOT stop a plain move on x_min / y_min,
+// even with M120, so one long move rams the head into the frame. The bridge steps instead,
+// like Z: a step, M400, M119, until the switch reads pressed. At most one step past it.
 #define XY_SEEK_STEP_MM 1.0f
 #define XY_FINE_STEP_MM 0.1f
 
