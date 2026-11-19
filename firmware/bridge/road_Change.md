@@ -25,7 +25,7 @@ controlled. This file grows one chapter at a time, as each step is done.
 - [x] 5. Review fixes: guard parsing, home abort, queue full
 - [x] 6. Setting tweaking: limits and homing / move tunables, saved on the bridge
 - [x] 7. Foundation: guard host tests, single-write UART lines, API token, OTA rollback, CI
-- [x] 8. X/Y homing in steps: Marlin ignored the endstops on a plain move
+- [x] 8. X/Y homing in steps, not relying on Marlin to stop at the endstop
 - [ ] 9. Laser safety and laser on/off / power control (kept up to date when the laser goes in)
 
 ## 1. Hardware: heaters and sensors out (done)
@@ -183,23 +183,27 @@ curl -H "X-Token: <secret>" --data-binary @build/m200_bridge.bin http://m200.loc
 ## 8. X/Y homing in steps (done, built, not flashed yet)
 
 First home on the printer (2026-11-19): `M120`, `G91`, `G1 X-200 F3000`. The head went to the
-X switch, pressed it, and **kept driving into the frame** until the power was cut. So this
-Marlin does not stop a plain move on `x_min` / `y_min`, even with endstop checking on.
-Chapter 3 assumed it did.
+X switch and **kept driving into the frame** until the power was cut. The X/Y endstops were
+**not plugged in** at the time, so this doesn't show whether Marlin stops a plain move on
+`x_min` / `y_min` with `M120` on (chapter 3 assumes it does). Still open, test it on purpose.
+
+The home no longer depends on it:
 
 - X and Y now home like Z: **1 mm steps** toward the switch, `M400` + `M119` after each, until
   it reads pressed. So the head goes at most one step past the switch, whatever Marlin does.
   Then back off (`backoff`), **0.1 mm steps** at the slow speed, `G92`, park.
 - Starting on the switch: back off first. A switch that stays pressed after backing off is
   reported (wiring, or an inverted switch) instead of seeking.
-- `M120` is still sent, in case it helps; nothing relies on it.
+- `M120` is still sent.
 - Slower than one long move: about 30 s for a full 170 mm seek.
 - The step sizes are constants in `printer_state.c` (`XY_SEEK_STEP_MM`, `XY_FINE_STEP_MM`),
   not settings yet.
-- Before the next Home: check `M119` shows `x_min: TRIGGERED` / `y_min: TRIGGERED` while the
-  switch is held by hand. If it doesn't, the switch isn't read at all, and stepping can't help.
-- Jogs: a homed axis can't leave 0..max. Without homing ("move without homing") nothing
-  stops a jog at a switch either, for the same reason.
+- **What stepping can't catch: an unplugged switch.** It reads `open` in `M119`, so the seek
+  still drives the whole distance (in steps). Before a first Home, hold each switch by hand
+  and check `M119` shows `x_min: TRIGGERED` / `y_min: TRIGGERED`.
+- Once the switches are in: jog an axis slowly toward its switch with `M120` on and see
+  whether Marlin stops. If it does, unhomed jogs are protected too; if not, only homed
+  axes are (by the 0..max limits).
 
 ## 9. Laser safety (open: kept up to date when the laser goes in)
 
