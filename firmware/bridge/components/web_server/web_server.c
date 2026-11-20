@@ -62,11 +62,6 @@ static esp_err_t asset_get(httpd_req_t *req)
 
 // ---------------------------------------------------------------- JSON builders
 
-static const char *link_name(printer_link_state_t s)
-{
-    return s == PRINTER_LINK_UP ? "up" : s == PRINTER_LINK_NO_REPLY ? "no_reply" : "unknown";
-}
-
 static void jb_temp(jbuf_t *b, const marlin_temp_t *t)
 {
     if (t->valid) {
@@ -81,7 +76,7 @@ static void jb_state(jbuf_t *b, bool with_type)
     printer_state_t s;
     printer_state_get(&s);
     jb_puts(b, with_type ? "{\"t\":\"state\"," : "{");
-    jb_printf(b, "\"link\":\"%s\",\"nozzle\":", link_name(s.link));
+    jb_printf(b, "\"link\":\"%s\",\"nozzle\":", printer_link_state_name(s.link));
     jb_temp(b, &s.nozzle);
     jb_puts(b, ",\"bed\":");
     jb_temp(b, &s.bed);
@@ -137,7 +132,8 @@ static void jb_settings(jbuf_t *b, bool with_type)
 }
 
 // Settings from a flat JSON object ({"max_x":180,"park":10}): keys left out keep their value.
-static const char *apply_settings(const char *js)
+// True when applied, else false and why not in why.
+static bool apply_settings(const char *js, char why[PRINTER_STATE_WHY_MAX])
 {
     float v[PS_COUNT];
     printer_state_get_settings(v);
@@ -149,11 +145,12 @@ static const char *apply_settings(const char *js)
         char *end;
         float f = strtof(p, &end);
         if (end == p) {
-            return "Error:bridge: settings: not a number";
+            strlcpy(why, "Error:bridge: settings: not a number", PRINTER_STATE_WHY_MAX);
+            return false;
         }
         v[i] = f;
     }
-    return printer_state_set_settings(v);
+    return printer_state_set_settings(v, why);
 }
 
 static void jb_line(jbuf_t *b, bool tx, printer_source_t src, const char *text)
@@ -312,8 +309,8 @@ static void hello_work(void *arg)
 
 // ---------------------------------------------------------------- commands from clients
 
-// 1 queued, 0 empty / refused / emergency, -1 dropped: queue full, the caller stops the batch
-// (a jog without its G91 would run as an absolute move).
+// Trim, then printer_state_submit(): 1 sent / queued, 0 empty / too long / refused, -1 queue
+// full: the caller stops the batch (a jog without its G91 would run as an absolute move).
 static int submit_line(const char *raw)
 {
     char line[USER_LINE_MAX + 1];
@@ -325,29 +322,15 @@ static int submit_line(const char *raw)
         n--;
     }
     if (n == 0) {
-        return false;
+        return 0;
     }
     if (n > USER_LINE_MAX) {
         ESP_LOGW(TAG, "line too long (%u chars), dropped", (unsigned)n);
-        return false;
+        return 0;
     }
     memcpy(line, raw, n);
     line[n] = '\0';
-    if (strncasecmp(line, "M112", 4) == 0 && (line[4] == '\0' || line[4] == ' ')) {
-        return printer_state_soft_stop(PRINTER_SRC_WEB) == ESP_OK;  // same as the STOP button
-    }
-    if (printer_is_emergency_command(line)) {
-        return printer_emergency(line, PRINTER_SRC_WEB) == ESP_OK;
-    }
-    if (!printer_state_allow(line, PRINTER_SRC_WEB)) {
-        return false;
-    }
-    if (printer_send(line, PRINTER_SRC_WEB, pdMS_TO_TICKS(200)) != ESP_OK) {
-        ESP_LOGW(TAG, "printer queue full, dropped: %s", line);
-        printer_state_dropped(line);
-        return -1;
-    }
-    return 1;
+    return printer_state_submit(line, PRINTER_SRC_WEB, pdMS_TO_TICKS(200));
 }
 
 // ---------------------------------------------------------------- WebSocket login
@@ -440,7 +423,8 @@ static void handle_client_json(httpd_req_t *req, const char *js)
     } else if (strcmp(type, "home_z") == 0) {
         printer_state_home_z();
     } else if (strcmp(type, "settings_set") == 0) {
-        apply_settings(js);  // the answer is a "settings" message, or an Error:bridge: line
+        char why[PRINTER_STATE_WHY_MAX];
+        apply_settings(js, why);  // the answer is a "settings" message, or an Error:bridge: line
     } else if (strcmp(type, "gcode") == 0) {
         const char *start = jin_find(js, "lines");
         if (!start || *start != '[') {
@@ -691,9 +675,10 @@ static esp_err_t api_settings_post(httpd_req_t *req)
     if (!body) {
         return ESP_FAIL;
     }
-    const char *why = apply_settings(body);
+    char why[PRINTER_STATE_WHY_MAX];
+    bool ok = apply_settings(body, why);
     free(body);
-    if (why) {
+    if (!ok) {
         jbuf_t b;
         jb_init(&b, 128);
         jb_puts(&b, "{\"ok\":false,\"error\":");

@@ -26,6 +26,8 @@ controlled. This file grows one chapter at a time, as each step is done.
 - [x] 6. Setting tweaking: limits and homing / move tunables, saved on the bridge
 - [x] 7. Foundation: guard host tests, single-write UART lines, API token, OTA rollback, CI
 - [ ] 8. Laser safety and laser on/off / power control (kept up to date when the laser goes in)
+- [x] 9. Review fixes 2: guard holes (`M 104`, `M104 I0`), nothing runs after a STOP
+- [x] 10. Web page: camera row above the console
 
 ## 1. Hardware: heaters and sensors out (done)
 
@@ -202,3 +204,303 @@ place **before** the laser module is fitted, and is filled in step by step with 
   and which commands the bridge then lets through or refuses.
 - Enclosure, eye protection, fire watch.
 
+
+## 9. Review fixes 2 (done, built, not flashed yet)
+
+A second project review found two holes in the heat guard and a race around STOP. Checked
+against Marlin's own source (bugfix-2.1.x `parser.cpp`, `M104_M109.cpp`, `M140_M190.cpp`).
+
+| Problem | Fix |
+|---|---|
+| Marlin skips spaces between the letter and the number, the guard didn't: `M 104 S200`, `M 140 S30`, `G 28`, `G 29` went through and Marlin ran them (MINTEMP kill) | `gcode_command_code()` skips them like Marlin. The heater-target display, the axis tracking and the mock (`parse_gcode()`) read them the same way. `M 112` / `M 410` now also count as emergency commands |
+| `M104 I<n>` / `M140 I<n>` (heat to material preset n, `HAS_PREHEAT`) passed: the guard only read `S` / `R`, and in Marlin `I` wins over `S` | any heater command with an `I` value is refused, whatever `S` says |
+| STOP race: the home task checked "aborted?" and then queued its next move, unlocked. A STOP in between let that move run **after** the STOP's `M84 / G90 / M121`. Same for a web / console line that passed the guard just before the STOP. A typed `M410` / `M108` was worse: the home only saw it later, from the event loop | **epochs** in `printer_link`: every emergency command starts a new one. A sender reads the epoch *before* it decides and queues with `printer_send_at()`; the TX task drops any line from an older epoch. The home keeps the epoch it started with, so any emergency aborts it and drops its queued lines, and a dropped `G92` can no longer mark an axis homed |
+| A typed `M410` / `M108` that aborted an X/Y home left Marlin in `G91` with endstops on (only the STOP button sends `G90 / M121`) | after a failed or aborted X/Y home the bridge sends `G90`, `M121` (not after a soft STOP, which sends them, or a kill) |
+| `printer_state_allow()` printed a refusal from a shared static buffer after releasing the lock: two refusals at once could swap their messages | copied under the lock |
+
+New host tests: `M 104 S200`, `M  140 S30`, `N7 M 109 R180`, `M104 I0`, `M140 I1`,
+`M190 S0 I0`, `M109I0`, `G 28`, `G 29`, `M 48`, plus `gcode_command_code()` with spaces and
+`gcode_emergency_code()`.
+
+Cleanups in the same step, no change in behaviour except where noted:
+
+| Before | Now |
+|---|---|
+| Console and web each did emergency check, epoch, guard, queue, "queue full" on their own: a new client (job, telnet) could forget a step, the epoch above all | one path, `printer_state_submit()`. `printer_state_allow()` / `_dropped()` are private now |
+| Two G-code readers: `printer_link` read `M112` / `M410` itself, `gcode_guard` everything else (that's how `M 112` slipped past one of them) | `gcode_emergency_code()` in `gcode_guard`, host-tested; `printer_link` only writes. It now also reads `N5 M112` as an emergency, like Marlin |
+| `link_name()` in the web server copied `printer_link_state_name()` | one function, lowercase (`up`, `no_reply`, `unknown`): the console's `!net` and the log now print it lowercase too |
+| `printer_state_set_settings()` / `refusal()` returned a shared static buffer | the caller passes the buffer (`PRINTER_STATE_WHY_MAX`) |
+| Saved settings that don't fit together fell back to defaults silently | same, with a warning in the log |
+| Docs: `newStatus.md` pointed to files not in the repo, listed Preheat / hotend buttons, said "confirm during a real `G28`"; `protocol.md` still said the heat refusal depends on `unplugged`; the README had no word on a Windows compiler | updated; `esps32Plan.md` got a note that it is the original plan |
+
+Kept on purpose: `PRINTER_SRC_TELNET` / `_BLE` (milestone 5), `PRINTER_SRC_JOB` and
+`marlin_format_numbered()` (job streaming).
+
+Status: the firmware builds (IDF v6.1.1), no new warnings. The host tests pass on this PC
+(MSYS2 UCRT64 gcc 16.2, which `tools/run_host_tests.sh` now finds by itself), and 12 of the
+new cases fail against the old guard, so they really cover the holes. To check after flashing: `M 104 S200` and `M104 I0` on the console give
+`Error:bridge: ... heating refused`; STOP during an X/Y home leaves no move afterwards.
+
+## 10. Web page: camera row (done, built, not flashed yet)
+
+A **Camera** row sits above the console, full width (under the Presets on a phone). The source
+is chosen in Setting tweaking, group **Camera**:
+
+| Setting | Values |
+|---|---|
+| Source | Off / Stream (MJPEG, shown live) / Snapshot (a JPEG, loaded again every N s) |
+| URL | any `http://` / `https://` picture URL. ESP32-CAM: `http://<camera>:81/stream` or `http://<camera>/capture`; mjpg-streamer: `?action=stream` |
+| Snapshot every | 1..60 s |
+| Rotate / Mirror | 0 / 90 / 180 / 270°, mirror on / off |
+
+- **Kept in the browser only** (`localStorage`), on purpose: the bridge never sees the camera
+  data, and each phone / PC picks its own. No firmware or protocol change; the sheet's Save
+  stores it even while the bridge is offline.
+- Pause (frees a camera that allows one viewer), reconnect, full screen. A hidden tab stops
+  the stream; an unreachable camera shows a message and retries every 5 s.
+- The viewing device's own webcam can't be used: browsers allow that only on https, the
+  bridge serves plain http. A camera has to serve its picture over the network itself.
+
+Checked in headless Chrome against `tools/mock_bridge.py` with a test picture: placement
+above the console, 0 / 90 / 180° + mirror, phone width without side scroll, unreachable
+camera, bad URL refused on Save, Off hides the row's buttons. No console errors.
+
+A USB camera on the PC is served by `tools/usb_cam.py` (OpenCV): `--list` shows the cameras
+that give a picture, `--cam N` serves one at `http://<pc>:8081/stream` and `/snapshot`, one
+capture shared by every viewer.
+
+**The USB camera works** ("USB Live camera", Sonix 0C45:6537, `--cam 1`): 640x480 at 15 fps
+over the LAN, shown live in the page. What stood in the way:
+
+- The maker's app (**Angetube Camera**) held the camera. Close it before starting usb_cam.py.
+- Asking the camera for a frame rate (`CAP_PROP_FPS`) stalls it: every read timed out after
+  10 s (MSMF `E_PENDING`), which looked like a hang. The script never sets it now; `--fps`
+  only paces the server.
+- The script uses **DirectShow** by default (was Media Foundation): only DirectShow can
+  change the camera's settings, and it gives HD as MJPEG (`--size 1280x720` about 9 fps,
+  1920x1080 about 3 fps, still on the hub). Same numbers here: cam 0 built-in, cam 1 USB.
+
+### Camera settings in the page (the Angetube app's controls)
+
+A **sliders button** in the Camera row opens the camera's own settings: brightness, contrast,
+saturation, hue, sharpness, gamma, gain, backlight compensation, exposure (Auto), white
+balance (Auto), focus (Auto), zoom. Moving a slider switches its Auto off, like the driver
+does; Reset puts back the camera's values from the first start.
+
+- `tools/usb_cam.py` serves them at `GET /controls` and changes them with
+  `POST /controls` (`{"brightness": {"value": 20}, "wb": {"auto": true}}` or
+  `{"reset": true}`), with CORS so the bridge's page can call the PC directly. The bridge
+  still never sees the camera.
+- The driver gives no ranges through OpenCV, so each one is found at start by trying values
+  (DirectShow refuses out-of-range ones, about 1 s for all). Exposure accepts any number:
+  its range is fixed at -13..-1 (log2 s). Exposure doesn't report Auto: the script keeps it,
+  on by default (the room is dark: a fixed -6 gives a black picture).
+- Values are saved in `~/.m200_usb_cam.json` and applied again at every start.
+- The button shows only for a camera that answers `/controls`, asked once per camera (and
+  again after it was offline); an ESP32-CAM gets no button. Slider moves are sent at most
+  one request at a time, merged meanwhile. Every viewer changes the same camera.
+
+Checked in headless Chrome against the real camera: all 12 settings listed with their
+ranges, a quick drag ends on the last value, Auto on then slider = manual, phone width
+without side scroll, Reset, no button for a camera without `/controls`. No console errors.
+
+## 11. Bed scan: tiles and collage (PC tool, no firmware change)
+
+`tools/scan_bed.py` photographs the bed in a grid of overlapping tiles and puts them together
+into one picture. It drives the head through the bridge's REST API and takes the pictures from
+`tools/usb_cam.py`. Firmware and page unchanged.
+
+- **Setup**: bridge reachable, X/Y homed (Home XY in the page: G28 is refused), not stopped or
+  halted. Z is never moved. The limits (`max_x/y`) and the feed (`jog_f_xy`) come from the
+  bridge's settings. Coordinates are mm from the switches, the frame the guard checks.
+- **Camera locked** for the scan through `/controls`: exposure matched to what auto gave (same
+  brightness), focus set by sharpness, white balance on its slider value (or `--exposure`,
+  `--focus`, `--wb`). Put back at the end.
+- **Calibration**: `--check` moves the head 2 mm in X and in Y and measures the picture shift
+  (phase correlation). That tells whether the camera rides on the head, the mm/px, and the
+  rotation/mirror (same order as the page: mirror, then rotate clockwise). `--calibrate`:
+  click two marks on a ruler and type the mm. Both save `scans/calibration.json`.
+  `--lens-calibrate` + `--undistort`: optional checkerboard lens correction.
+- **Grid**: tile centres over the bed (or `--area`), `--overlap 0.25`, snake order.
+- **Per tile**: one batch `G90 / G0 X Y F / M400 / M114`. The `queue` count leaves out the line
+  in flight, so the move counts as done when `/api/state` `pos` (the M114 answer, which M400
+  holds back until the move has ended) equals the target. Then settle 0.5 s, throw away one
+  snapshot, keep the next new one: `scans/<date_time>/tile_rRR_cCC.jpg` + `tiles.json`.
+- **Collage**: each tile placed by its X/Y x px/mm (feathered overlaps, or `--blend crop`).
+  `--stitch` also tries `cv2.Stitcher` (SCANS mode). `--collage-only`, `--resume`, `--dry-run`;
+  Ctrl+C leaves the head where it is.
+
+Checked: a synthetic bed cut into rotated + mirrored tiles comes back matching the original
+(mean error 2.4/255, JPEG noise), and `--check` finds that rotation/mirror and the scale
+(0.252 for 0.25 mm/px). Against `tools/mock_bridge.py` with the real camera: 6 tiles in 19 s,
+`--resume` re-shoots only the missing ones, settings put back, `--check` reports a fixed camera
+(the mock's head doesn't carry it). Found on the way: on Windows `localhost` tries IPv6 first
+and costs 2 s per request to usb_cam.py; the script looks each host up once, IPv4.
+Guards: a black or white picture (light off, lens covered) stops the scan before any move;
+a camera that refuses manual exposure/focus (seen once at night: every `/controls` change
+ignored) gives a warning; bridge or camera gone mid-scan stops cleanly, settings put back.
+### First real scan: the collage was wrong, fixed (2026-11-20)
+
+The first 4 x 3 scan on the printer (01:50) gave a broken collage: ruler pieces didn't line up,
+features doubled, diamond moire in every overlap. Measured from the tiles themselves:
+
+- The camera is **turned about 3 degrees** against the axes (not a whole 90). Only 0/90/180/270
+  were possible, so each tile edge was about 30 px out.
+- The ruler scale was right (0.1199 vs 0.1195 mm/px measured).
+- Feathering two hole patterns a few px apart makes moire.
+- The first scan (01:48) was blurry and changed brightness halfway: the camera wasn't locked
+  (two usb_cam.py were running and fought over the camera). Not a collage problem.
+
+Now the collage measures a 2x2 mapping (mm per raw pixel: scale, any angle, mirror) from the
+neighbour overlaps: ORB matches, only near the expected shift, and the best cluster must beat
+the second by 2x (the holes and the edge screws repeat). Least squares over the pairs, twice
+(wide gate around the calibration, then tight). Each tile is warped onto the canvas with it.
+Default blend is now crop (each pixel from the tile whose centre is nearest), and a flat field
+(median of the blurred tiles) removes the bright spot the light makes in every tile (+-13 %).
+The mapping is saved in `scans/calibration.json` for scans too plain to measure.
+
+Checked: a synthetic bed with a 2.5 mm hole grid, camera at 0.128 mm/px turned 3 deg, told
+0.12 and 0 deg: measured 0.12806 mm/px and 3.00 deg from 29 pairs, error vs truth 43 -> 7.7.
+The real 01:50 scan: 6 pairs, 0.1195 mm/px, -2.8 deg, ruler continuous 8..24 cm, metal square
+whole. Left: about 6 px residual at the seams (lens distortion: `--lens-calibrate` +
+`--undistort` should take it), and the metal square looks different from each angle.
+`scans/` is in `.gitignore`.
+
+### Live view and a better overlap measurement (2026-11-20)
+
+- `--show`: a window with one cell per tile, laid out like the bed (+Y up), filled in as the
+  photos are taken (yellow frame: moving there, green: just taken), then the collage in a
+  second window. Saved as `contact.jpg` next to the tiles.
+- Second real scan (02:02, 4 x 3, max 180 mm now): the ORB matching found only 1..21 good
+  matches per pair (the plate is mostly identical holes) and measured nothing. Replaced by
+  phase correlation of the strip both tiles show, cut where the current mapping predicts it,
+  strength >= 0.06, three passes, pairs the fit can't explain dropped. Result: 12 of 17 pairs,
+  rms 2.6 px (was 6 px with ORB on the 01:50 scan); 01:50 now 15 pairs, rms 3.9 px. Both
+  scans agree: 0.1188 / 0.1187 mm/px, camera turned -2.7 / -2.6 deg. Synthetic test still
+  exact (0.12799 for 0.128 mm/px, 93.00 for 93 deg).
+
+Not done yet: a scan with the lens correction.
+
+## 12. Web page: Scan and Collages buttons (done, built, not flashed yet)
+
+Two buttons in the Camera row start a bed scan and show the last ones. The scan still runs on
+the PC: the camera is there, the bridge never sees a picture.
+
+- `tools/usb_cam.py` runs `scan_bed.py`'s scan in a thread (one program holds the camera):
+  `POST /scan/start` with `{"bridge": <the page's own address>, "token": <the page's token>}`,
+  `GET /scan/status` (state, plan, tiles done, the one being moved to, last log lines),
+  `POST /scan/stop` (before the next move; the head stays, camera settings put back),
+  `GET /scans` (last 12), `GET /scans/<name>/<tile|collage|contact>.jpg[?w=N]` (tiles turned
+  like the collage; only those names, no paths). The head moves with the page's token, so the
+  bridge's login decides as for any other command.
+- Page: the buttons show only for a camera server that answers `/scan/status` (like the sliders
+  button and `/controls`). **Scan** opens a sheet: Start (enabled once X/Y are homed and the
+  printer is ready), then the grid laid out like the bed (+Y up) fills in tile by tile (orange:
+  moving there, green: just taken), sized to fit the screen; then the collage (tap: full size).
+  Start turns into Stop while it runs. **Collages** lists the last scans with a thumbnail,
+  date, tile count, and links to the collage and the tile grid.
+- `scans/` is now always the repo root's, from any working directory.
+- A fit the tiles can't support is no longer used: rms over 8 px or the scale 25 % off the
+  calibration -> placed by the saved mapping. Found by a test with a fixed webcam (rms 131 px,
+  "0.145 mm/px, +12.5 deg" had been used for the collage).
+
+Checked in headless Chrome against `tools/mock_bridge.py` with a camera server on the PC's
+built-in webcam (port 8082; the USB camera's server was left running): buttons appear,
+Start -> 12 cells, "tile 6/12: moving to row 1 col 2" with r1c2 orange and r1c3 green (snake
+order), row 0 at the bottom, all 12 tiles and the collage load, Collages lists the scans with
+thumbnails, phone width without side scroll, no console errors. Path tricks
+(`..%2F..`, `tiles.json`) answer 404, a bad bridge address 409. Firmware built with the new
+page (app.js.gz contains it).
+
+### Cleaner tiles, focus held (2026-11-20)
+
+- **Focus held where autofocus had it** when the scan starts (it was searched, or jumped to the
+  old slider value 520). Cause: switching Auto off made `usb_cam.py` write the stored slider
+  value back. Now Auto off writes no value, so the camera stays where automatic left it
+  (focus, white balance). Reading the live value doesn't work: DirectShow reports the last
+  value set by hand while Auto is on (built-in webcam: set 6500, Auto on, reads 6500 for 4 s).
+  Focus is locked first, before exposure changes can make autofocus hunt. A sharpness check
+  before/after the lock falls back to the search only if the lens moved anyway (< 70 %).
+- **Cleaner tiles**: `usb_cam.py` `GET /frame[?after=seq]` gives the next frame uncompressed
+  (PNG, `X-Frame-Seq`). Each tile is the average of `--frames 4` of them taken after the
+  settle, frames below 80 % of the sharpest left out (head still shaking), saved as JPEG 95.
+  Noise drops by about 2x (sqrt 4) and there are no stream-JPEG blocks.
+- `--calibrate` drops the saved mapping (the camera may have been moved).
+
+Checked on the built-in webcam (the USB camera was unplugged while being remounted): `/frame`
+gives newer frames, Auto WB off without a write kept auto's colour, a 2-tile scan with the
+averaged capture against the mock. Still to check on the USB camera: the focus stays sharp
+after the lock, and the noise gain on a lit bed.
+
+### After the camera was remounted: collage wrong, tiles shown upright (2026-11-20)
+
+Scans 03:25 and 03:29 (camera remounted, then moved again) gave a messy collage and tiles shown
+standing up in the page. The camera is now turned 180 deg (was 270) and higher (0.149 and
+0.193 mm/px, was 0.119). The overlap measurement looks for the shift near the calibration's
+guess, so it found nothing, and the tiles were placed and shown with the old mounting.
+Comparing whole pictures without a guess doesn't work on this plate: the camera-fixed light
+spot and the moire win, or a neighbouring hole of the grid.
+
+The hole grid is the fix. Its spectrum (2D FFT, light and pixel noise filtered out) gives the
+hole spacing in px and the grid angle in every tile. The spacing is a fixed size on the plate
+(1.814 mm, from the 02:02 scan), so it gives the scale of any picture; the angle gives the
+camera's turn up to 90 deg.
+
+- The collage measurement starts from the calibration; if the tiles don't confirm it, from
+  the hole grid's scale and turn with each of the four 90 deg choices. A result counts only
+  if the tiles agree (rms <= 8 px) and the scale matches the hole grid (10 %).
+- A trusted result is saved in `scans/calibration.json` (scale, rot / flip to the nearest
+  90 deg, the mapping, the hole-grid reference) only if the scan is newer than the one it
+  came from (rebuilding an old scan doesn't undo a remount). The scan's `rot` is updated
+  too, so its tiles show upright in the page and in the tile grid.
+- At the start of a scan the first picture's hole grid is compared with the calibration: a
+  moved camera (scale > 5 % off or turned > 3 deg) is reported and the grid is planned with
+  the new scale and a square field (the turn may be 90 deg), before any move.
+
+Result: 03:29 measured from all 17 pairs, rms 3.3 px, 0.1494 mm/px, rot 180 + 1.7 deg; 03:25
+11 pairs, rms 3.0 px, 0.1930 mm/px. Collage: plate whole, ruler straight along the front,
+edge screws in line. The next grid: 3 x 4 tiles of 95.6 x 71.7 mm. 02:02 still the same
+(12 pairs, 2.6 px). Synthetic test unchanged.
+
+### Left and front strips missing (2026-11-20)
+
+Scan 03:39 measured well (17 pairs, 2.4 px) but the collage had no left and no front edge of
+the plate, while it showed the wood beyond the right edge. The grid kept the head half a
+picture inside each end of the travel (X 47.8..132.2, Y 35.8..144.2): right only if the
+camera looks straight at the nozzle. It sits beside it, so its view is shifted and the left
+and front strips were never photographed. Now the head goes over its whole travel by
+default, 1 mm off each end (0 is where the home switch triggers): X/Y 1..179 here, 4 x 5 =
+20 tiles instead of 12. `--area` still limits it.
+
+### 4 x 4 grid, tiles placed where the photos say (2026-11-20)
+
+- Scan 03:44 still had the old 3 x 4 plan (head from X 47.8): `usb_cam.py` keeps the
+  `scan_bed.py` it loaded at start, so it must be restarted after an update. That was the
+  "skipped" first column.
+- Default overlap 15 % (was 25 %): 4 x 4 = 16 tiles over the whole travel with this camera
+  (17 % overlap in Y, 38 % in X), enough to measure. `--grid CxR` fixes the counts.
+- Each tile is placed where its overlaps say it was, not only where the head was sent: the
+  neighbour pairs that match well give the distances between the pictures, least squares
+  finds the positions (commanded positions as a weak pull). 03:39 and 03:29: corrections up
+  to 0.4-0.5 mm (backlash). Synthetic: a tile recorded 2 mm off placed 0.25 mm from the truth.
+- 03:44 is mechanically wrong: every X move also moved the picture ~1.1 mm in Y, the last row
+  5.7 and 6.6 mm (strong matches, so real). 03:39, five minutes earlier, is within 0.5 mm. A
+  loose camera mount swinging with the head, or Y skipping steps. The collage now says so
+  ("corrected by up to 5.86 mm ... loose camera or skipped steps?").
+- Only a clean fit (rms <= 4 px) becomes the calibration: 03:44's 7.3 px fit had replaced the
+  good 03:39 one (put back).
+
+### Head range set by hand: X 5..135, Y 2..160, 4 x 4 (2026-11-20)
+
+The camera sits beside the nozzle, so the useful head range is not the whole travel: with
+this mount the bed is covered by the head going X 5..135 and Y 2..160 (found by eye from the
+collages). `--head-area x0,y0,x1,y1` gives the first and last head position exactly,
+`--grid 4x4` the counts; `--save-settings` keeps both in `scans/scan_settings.json`, which
+every scan uses by default, including the page's Scan button. Saved now: 5,2,135,160 and 4x4
+(X 5 / 48.3 / 91.7 / 135, Y 2 / 54.7 / 107.3 / 160; overlap 55 % in X, 26 % in Y).
+The last scans (03:44, 03:49) still had the old 3 x 4 plan: the camera server had been
+started at 03:20 and runs the `scan_bed.py` it loaded then. Restart it after an update.
+- 03:57 again 3 x 4: the same camera server from 03:20. `usb_cam.py` now loads `scan_bed.py`
+  again at every Start (`importlib.reload`; a broken file is reported, the last good one
+  stays), so a changed scan_bed.py counts without restarting the camera. This change itself
+  needs one restart.

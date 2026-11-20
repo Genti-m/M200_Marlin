@@ -3,6 +3,8 @@
 // Clients call printer_send(): the line goes on a queue, one task sends it and waits for "ok"
 // ("busy:" restarts the wait, "Resend:" resends, a timeout marks the link NO_REPLY).
 // printer_emergency() skips the queue and writes straight to the UART (M112 / M108 / M410).
+// Clients don't call these directly for user lines: printer_state_submit() does, after the
+// guard.
 // Everything received is published on the default esp_event loop as PRINTER_EVENT_RX_LINE.
 #pragma once
 
@@ -57,12 +59,18 @@ esp_err_t printer_link_start(void);
 // Queue one G-code line (without newline). Returns ESP_ERR_TIMEOUT if the queue stays full.
 esp_err_t printer_send(const char *line, printer_source_t source, TickType_t wait);
 
-// Clear the queue and write one line straight to the UART. Without EMERGENCY_PARSER in Marlin
-// (the case for this printer) it still runs only after the command Marlin is executing.
-esp_err_t printer_emergency(const char *line, printer_source_t source);
+// Every printer_emergency() starts a new epoch. A caller that decides to send a line (checks
+// STOP, the guard, a home's abort flag) reads the epoch BEFORE deciding and queues with
+// printer_send_at(): if an emergency came in between, the TX task drops the line instead of
+// sending it after the STOP. printer_send() uses the epoch current when it is called.
+uint32_t printer_link_epoch(void);
+esp_err_t printer_send_at(const char *line, printer_source_t source, TickType_t wait,
+                          uint32_t epoch);
 
-// True for M112 / M108 / M410, the commands that should use printer_emergency().
-bool printer_is_emergency_command(const char *line);
+// Clear the queue and write one line straight to the UART (M112 / M108 / M410: the caller
+// decides, see printer_state_submit()). Without EMERGENCY_PARSER in Marlin (the case for this
+// printer) it still runs only after the command Marlin is executing.
+esp_err_t printer_emergency(const char *line, printer_source_t source);
 
 printer_link_state_t printer_link_get_state(void);
 
@@ -72,6 +80,7 @@ uint32_t printer_link_queue_len(void);
 // Free places in the queue: a batch that must go in whole (a jog) checks this first.
 uint32_t printer_link_queue_free(void);
 
+// "unknown" / "up" / "no_reply": logs, the console and the web state's "link" field.
 const char *printer_link_state_name(printer_link_state_t state);
 
 #ifdef __cplusplus

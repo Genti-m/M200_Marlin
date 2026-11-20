@@ -28,7 +28,8 @@ typedef struct {
 
 // Code of a G/M word at the start of the line ("N12 G28 X" -> 28 for 'G'), else -1.
 // *rest (if not NULL) points behind the number. Marlin needs no spaces ("N12G28X",
-// "M104S200"), so the number may be followed directly by the next word. "G28.1" -> -1.
+// "M104S200"), so the number may be followed directly by the next word, and like Marlin it
+// skips spaces between letter and number ("M 104" -> 104). "G28.1" -> -1.
 int gcode_command_code(const char *line, char letter, const char **rest);
 
 // Value of one word in what follows the command code (" S200", 'S' -> 200). A word starts
@@ -39,6 +40,10 @@ bool gcode_num_param(const char *rest, char letter, float *out);
 // Target of a heater command: S, or R for M109/M190 ("wait, also when cooling").
 bool gcode_heater_target(const char *rest, float *out);
 
+// 112 / 108 / 410 when the line is M112 / M108 / M410 as Marlin reads it ("N5 M 410" too),
+// else 0. These skip the bridge queue (printer_emergency()).
+int gcode_emergency_code(const char *line);
+
 // Machine position (0 = switch) of logical position l on axis a.
 float gcode_machine(const gcode_axis_t *a, float l);
 
@@ -46,7 +51,8 @@ float gcode_machine(const gcode_axis_t *a, float l);
 void gcode_unhome(gcode_motion_t *m);
 
 // Why the laser build must not send this line, or NULL:
-//  - a heater target above 0 (M104/M109/M140/M190 S/R), M303: no heaters, MINTEMP kill
+//  - a heater target above 0 (M104/M109/M140/M190 S/R), any preset target (I), M303: no
+//    heaters, MINTEMP kill
 //  - G28, G29, G30, M48: they preheat for the Z probe
 //  - G0-G3 taking a homed axis outside 0..max_mm[axis] of its switch (arcs: end point only;
 //    NaN fails too)

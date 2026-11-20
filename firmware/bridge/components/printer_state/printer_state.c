@@ -314,34 +314,37 @@ static esp_err_t settings_save(const float *v)
     return err;
 }
 
-// Why these values can't be used together, or NULL.
-static const char *settings_check(const float *v)
+// True when these values can be used together, else false and why not in why.
+static bool settings_check(const float *v, char why[PRINTER_STATE_WHY_MAX])
 {
-    static char msg[96];  // only the web / REST tasks call this, one message at a time
+    const char *msg = NULL;
     for (int i = 0; i < PS_COUNT; i++) {
         const printer_setting_desc_t *d = &SETTINGS[i];
         if (!(v[i] >= d->min && v[i] <= d->max)) {
-            snprintf(msg, sizeof(msg), "Error:bridge: setting %s must be %g..%g", d->key,
-                     (double)d->min, (double)d->max);
-            return msg;
+            snprintf(why, PRINTER_STATE_WHY_MAX, "Error:bridge: setting %s must be %g..%g",
+                     d->key, (double)d->min, (double)d->max);
+            return false;
         }
     }
     if (v[PS_Z_DIR] != -1 && v[PS_Z_DIR] != 1) {
-        return "Error:bridge: setting z_dir must be -1 or 1";
+        msg = "Error:bridge: setting z_dir must be -1 or 1";
     }
-    for (int i = 0; i < 3; i++) {
+    for (int i = 0; i < 3 && !msg; i++) {
         if (v[PS_PARK] >= v[PS_MAX_X + i]) {
-            return "Error:bridge: setting park must be below every axis max";
+            msg = "Error:bridge: setting park must be below every axis max";
         }
     }
-    if (v[PS_BACKOFF] >= v[PS_PARK]) {
-        return "Error:bridge: setting backoff must be below park";
+    if (!msg && v[PS_BACKOFF] >= v[PS_PARK]) {
+        msg = "Error:bridge: setting backoff must be below park";
     }
-    if (v[PS_XY_SLOW_F] > v[PS_XY_FAST_F] || v[PS_Z_SLOW_F] > v[PS_Z_FAST_F] ||
-        v[PS_Z_SLOW_STEP] > v[PS_Z_FAST_STEP]) {
-        return "Error:bridge: the slow pass can't be faster or coarser than the seek";
+    if (!msg && (v[PS_XY_SLOW_F] > v[PS_XY_FAST_F] || v[PS_Z_SLOW_F] > v[PS_Z_FAST_F] ||
+                 v[PS_Z_SLOW_STEP] > v[PS_Z_FAST_STEP])) {
+        msg = "Error:bridge: the slow pass can't be faster or coarser than the seek";
     }
-    return NULL;
+    if (msg) {
+        strlcpy(why, msg, PRINTER_STATE_WHY_MAX);
+    }
+    return msg == NULL;
 }
 
 void printer_state_get_settings(float out[PS_COUNT])
@@ -353,21 +356,22 @@ void printer_state_get_settings(float out[PS_COUNT])
 
 static void post_note(const char *text);
 
-const char *printer_state_set_settings(const float in[PS_COUNT])
+bool printer_state_set_settings(const float in[PS_COUNT], char why[PRINTER_STATE_WHY_MAX])
 {
-    const char *why = settings_check(in);
+    bool ok = settings_check(in, why);
     xSemaphoreTake(s_mux, portMAX_DELAY);
-    if (!why && s.homing) {
-        why = "Error:bridge: settings can't change while homing";
+    if (ok && s.homing) {
+        strlcpy(why, "Error:bridge: settings can't change while homing", PRINTER_STATE_WHY_MAX);
+        ok = false;
     }
-    bool same = !why && memcmp(in, s.cfg, sizeof(s.cfg)) == 0;
-    if (!why && !same) {
+    bool same = ok && memcmp(in, s.cfg, sizeof(s.cfg)) == 0;
+    if (ok && !same) {
         memcpy(s.cfg, in, sizeof(s.cfg));
     }
     xSemaphoreGive(s_mux);
-    if (why) {
+    if (!ok) {
         post_note(why);
-        return why;
+        return false;
     }
     if (!same) {
         esp_err_t err = settings_save(in);
@@ -381,7 +385,7 @@ const char *printer_state_set_settings(const float in[PS_COUNT])
     // Also when unchanged: the client that sent them gets them back and closes its sheet.
     esp_event_post(PRINTER_STATE_EVENT, PRINTER_STATE_EVENT_SETTINGS, NULL, 0, 0);
     esp_event_post(PRINTER_STATE_EVENT, PRINTER_STATE_EVENT_CHANGED, NULL, 0, 0);
-    return NULL;
+    return true;
 }
 
 // ---------------------------------------------------------------- API
@@ -397,7 +401,9 @@ esp_err_t printer_state_start(void)
         return ESP_ERR_NO_MEM;
     }
     settings_load(s.cfg);
-    if (settings_check(s.cfg)) {  // each one in range, but not together: back to defaults
+    char why[PRINTER_STATE_WHY_MAX];
+    if (!settings_check(s.cfg, why)) {  // each one in range, but not together: back to defaults
+        ESP_LOGW(TAG, "saved settings rejected (%s): defaults", why);
         for (int i = 0; i < PS_COUNT; i++) {
             s.cfg[i] = SETTINGS[i].def;
         }
@@ -447,8 +453,9 @@ static void post_note(const char *text)
     esp_event_post(PRINTER_EVENT, PRINTER_EVENT_RX_LINE, &ev, sizeof(ev), pdMS_TO_TICKS(50));
 }
 
-// Why a line must not go to the printer now, or NULL. s_mux held.
-static const char *refusal(const char *line, printer_source_t source)
+// Why a line must not go to the printer now (a constant, or written to buf), or NULL.
+// s_mux held.
+static const char *refusal(const char *line, printer_source_t source, char *buf, size_t len)
 {
     if (s.stopped && source != PRINTER_SRC_CONSOLE) {
         return "Error:bridge: stopped, press RESTART first";
@@ -457,15 +464,17 @@ static const char *refusal(const char *line, printer_source_t source)
         return "Error:bridge: homing running, wait for it (STOP aborts it)";
     }
     // Heat, G28 / probing, and the 0..max limits (settings): gcode_guard, host-tested.
-    static char msg[96];  // s_mux held
     const float max_mm[3] = {s.cfg[PS_MAX_X], s.cfg[PS_MAX_Y], s.cfg[PS_MAX_Z]};
-    return gcode_refusal(&s.mo, max_mm, line, msg, sizeof(msg));
+    return gcode_refusal(&s.mo, max_mm, line, buf, len);
 }
 
-bool printer_state_allow(const char *line, printer_source_t source)
+// The guard: false (and an "Error:bridge:" line to all clients) when the line must not go
+// out now. An allowed line is tracked (G90/G91, G92, moves).
+static bool allow(const char *line, printer_source_t source)
 {
+    char buf[PRINTER_STATE_WHY_MAX];
     xSemaphoreTake(s_mux, portMAX_DELAY);
-    const char *why = refusal(line, source);
+    const char *why = refusal(line, source, buf, sizeof(buf));
     if (!why) {
         track(line);
     }
@@ -482,8 +491,11 @@ void printer_state_note(const char *text)
     post_note(text);
 }
 
-void printer_state_dropped(const char *line)
+// An allowed line didn't make it into the queue (full). The bridge already counted it, so the
+// homes are dropped (positions and G90/G91 no longer known) and an "Error:bridge:" line says so.
+static void dropped(const char *line)
 {
+    ESP_LOGW(TAG, "printer queue full, dropped: %s", line);
     xSemaphoreTake(s_mux, portMAX_DELAY);
     bool had = any_homed();
     unhome();
@@ -493,6 +505,27 @@ void printer_state_dropped(const char *line)
              had ? ": home lost, home again" : "");
     post_note(msg);
     esp_event_post(PRINTER_STATE_EVENT, PRINTER_STATE_EVENT_CHANGED, NULL, 0, 0);
+}
+
+int printer_state_submit(const char *line, printer_source_t source, TickType_t wait)
+{
+    int ec = gcode_emergency_code(line);
+    if (ec == 112 && source != PRINTER_SRC_CONSOLE) {
+        return printer_state_soft_stop(source) == ESP_OK;  // same as the STOP button
+    }
+    if (ec) {
+        return printer_emergency(line, source) == ESP_OK;
+    }
+    // Read before the guard: a STOP after this point makes the link drop the line.
+    uint32_t epoch = printer_link_epoch();
+    if (!allow(line, source)) {
+        return 0;
+    }
+    if (printer_send_at(line, source, wait, epoch) != ESP_OK) {
+        dropped(line);
+        return -1;
+    }
+    return 1;
 }
 
 // ---------------------------------------------------------------- homing without G28
@@ -510,6 +543,9 @@ void printer_state_dropped(const char *line)
 
 // The settings for the running home: copied when it starts (they can't change while homing).
 static float hc[PS_COUNT];
+// printer_link epoch when the home started: any emergency command (STOP, a typed M410 / M108)
+// changes it, which aborts the home, and the link drops home lines queued with the old one.
+static uint32_t s_home_epoch;
 
 // Seek a bit more than the whole travel, so "not reached" means the switch is missing.
 static float home_seek_mm(int axis)
@@ -519,23 +555,55 @@ static float home_seek_mm(int axis)
 
 static const char *const HOME_FAILED = "Error:bridge: homing failed (no reply or STOP)";
 
+// s_mux held.
+static bool home_aborted_locked(void)
+{
+    return s.home_abort || s.stopped || s.halted || printer_link_epoch() != s_home_epoch;
+}
+
 static bool home_aborted(void)
 {
     xSemaphoreTake(s_mux, portMAX_DELAY);
-    bool a = s.home_abort || s.stopped || s.halted;
+    bool a = home_aborted_locked();
     xSemaphoreGive(s_mux);
     return a;
 }
 
+// A STOP between the check and the queue can't let the line through: it is queued with the
+// home's epoch, which the STOP has already ended, so the link drops it. And it is tracked only
+// if the home still runs, so a dropped "G92" can't mark an axis homed after the STOP.
 static bool home_send(const char *line)
 {
-    if (home_aborted() || printer_send(line, PRINTER_SRC_INTERNAL, pdMS_TO_TICKS(1000)) != ESP_OK) {
+    if (home_aborted() ||
+        printer_send_at(line, PRINTER_SRC_INTERNAL, pdMS_TO_TICKS(1000), s_home_epoch) != ESP_OK) {
         return false;
     }
     xSemaphoreTake(s_mux, portMAX_DELAY);
-    track(line);
+    bool aborted = home_aborted_locked();
+    if (!aborted) {
+        track(line);
+    }
     xSemaphoreGive(s_mux);
-    return true;
+    return !aborted;
+}
+
+// The X/Y home turns endstops on and goes relative. After a failure, or an abort that wasn't a
+// soft STOP (which sends G90 / M121 itself) or a kill, put Marlin back: G90, M121. Both are
+// harmless if they land twice.
+static void home_restore_modes(void)
+{
+    xSemaphoreTake(s_mux, portMAX_DELAY);
+    bool skip = s.stopped || s.halted;
+    xSemaphoreGive(s_mux);
+    if (skip) {
+        return;
+    }
+    if (printer_send("G90", PRINTER_SRC_INTERNAL, pdMS_TO_TICKS(1000)) == ESP_OK) {
+        xSemaphoreTake(s_mux, portMAX_DELAY);
+        track("G90");
+        xSemaphoreGive(s_mux);
+    }
+    printer_send("M121", PRINTER_SRC_INTERNAL, pdMS_TO_TICKS(1000));
 }
 
 // fmt takes the value then the feedrate, e.g. "G1 Z%.3f F%d".
@@ -596,17 +664,18 @@ static const char *home_xy_axis(int i)
 
 static const char *home_xy_run(void)
 {
-    if (!home_send("M120") || !home_send("G91")) {
-        return HOME_FAILED;
+    const char *why = home_send("M120") && home_send("G91") ? NULL : HOME_FAILED;
+    if (!why) {
+        why = home_xy_axis(0);
     }
-    const char *why = home_xy_axis(0);
     if (!why) {
         why = home_xy_axis(1);
     }
-    if (!home_send("G90") || !home_send("M121")) {  // also after a failure
-        return why ? why : HOME_FAILED;
+    if (!why && (!home_send("G90") || !home_send("M121"))) {
+        why = HOME_FAILED;
     }
     if (why) {
+        home_restore_modes();  // also after an abort: home_send() sends nothing then
         return why;
     }
     xSemaphoreTake(s_mux, portMAX_DELAY);
@@ -722,6 +791,7 @@ static esp_err_t home_start(const home_job_t *job, uint8_t axes, const char *not
     if (!busy) {
         s.homing = true;
         s.home_abort = false;
+        s_home_epoch = printer_link_epoch();
         memcpy(hc, s.cfg, sizeof(hc));
         for (int i = 0; i < 3; i++) {
             if (axes & (1u << i)) {

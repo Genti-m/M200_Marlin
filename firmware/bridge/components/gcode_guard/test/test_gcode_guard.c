@@ -46,6 +46,10 @@ static void test_command_code(void)
     CHECK(gcode_command_code("G", 'G', NULL) == -1);
     CHECK(gcode_command_code("", 'G', NULL) == -1);
     CHECK(gcode_command_code("N", 'G', NULL) == -1);
+    CHECK(gcode_command_code("M 104 S200", 'M', &rest) == 104 && strcmp(rest, " S200") == 0);
+    CHECK(gcode_command_code("N5 G  28", 'G', NULL) == 28);
+    CHECK(gcode_command_code("G ", 'G', NULL) == -1);
+    CHECK(gcode_command_code("G X10", 'G', NULL) == -1);
 }
 
 static void test_num_param(void)
@@ -61,6 +65,20 @@ static void test_num_param(void)
     CHECK(gcode_heater_target(" R200", &v) && NEAR(v, 200));
 }
 
+static void test_emergency_code(void)
+{
+    CHECK(gcode_emergency_code("M112") == 112);
+    CHECK(gcode_emergency_code("  m410") == 410);
+    CHECK(gcode_emergency_code("M 108") == 108);
+    CHECK(gcode_emergency_code("N5 M 112") == 112);
+    CHECK(gcode_emergency_code("M112 ; stop") == 112);
+    CHECK(gcode_emergency_code("M1120") == 0);
+    CHECK(gcode_emergency_code("M11") == 0);
+    CHECK(gcode_emergency_code("G112") == 0);
+    CHECK(gcode_emergency_code("M112.1") == 0);
+    CHECK(gcode_emergency_code("") == 0);
+}
+
 static void test_heat_refused(void)
 {
     gcode_motion_t m = {0};
@@ -72,6 +90,15 @@ static void test_heat_refused(void)
     CHECK(refuse(&m, "m190 s60") != NULL);
     CHECK(refuse(&m, "M104 Snan") != NULL);
     CHECK(refuse(&m, "M303 E0 S200 C8") != NULL);
+    // space between letter and number: Marlin reads these as M104 / M140
+    CHECK(refuse(&m, "M 104 S200") != NULL);
+    CHECK(refuse(&m, "M  140 S30") != NULL);
+    CHECK(refuse(&m, "N7 M 109 R180") != NULL);
+    // material preset (I wins over S in Marlin)
+    CHECK(refuse(&m, "M104 I0") != NULL);
+    CHECK(refuse(&m, "M140 I1") != NULL);
+    CHECK(refuse(&m, "M190 S0 I0") != NULL);
+    CHECK(refuse(&m, "M109I0") != NULL);
     // off still passes: soft STOP sends it
     CHECK(refuse(&m, "M104 S0") == NULL);
     CHECK(refuse(&m, "M140 S0") == NULL);
@@ -90,6 +117,9 @@ static void test_probing_refused(void)
     CHECK(refuse(&m, "G29") != NULL);
     CHECK(refuse(&m, "G30") != NULL);
     CHECK(refuse(&m, "M48") != NULL);
+    CHECK(refuse(&m, "G 28") != NULL);
+    CHECK(refuse(&m, "G 29") != NULL);
+    CHECK(refuse(&m, "M 48") != NULL);
     CHECK(refuse(&m, "G280") == NULL);  // a different code
     CHECK(refuse(&m, "M119") == NULL);
 }
@@ -181,6 +211,7 @@ int main(void)
 {
     test_command_code();
     test_num_param();
+    test_emergency_code();
     test_heat_refused();
     test_probing_refused();
     test_limits();

@@ -54,9 +54,11 @@ typedef struct {
 
 const printer_setting_desc_t *printer_setting_desc(printer_setting_t i);
 void printer_state_get_settings(float out[PS_COUNT]);
-// Check, apply and save in NVS. NULL when done, else why not (nothing changed). Refused while
-// a home runs. Posts PRINTER_STATE_EVENT_SETTINGS and an "echo:bridge:" line.
-const char *printer_state_set_settings(const float in[PS_COUNT]);
+// Check, apply and save in NVS. True when done, else false and why not in why (nothing
+// changed). Refused while a home runs. Posts PRINTER_STATE_EVENT_SETTINGS and an
+// "echo:bridge:" line.
+#define PRINTER_STATE_WHY_MAX 96
+bool printer_state_set_settings(const float in[PS_COUNT], char why[PRINTER_STATE_WHY_MAX]);
 
 typedef struct {
     printer_link_state_t link;
@@ -99,20 +101,21 @@ void printer_state_get(printer_state_t *out);
 esp_err_t printer_state_soft_stop(printer_source_t source);
 void printer_state_restart(void);
 
-// Guard for user G-code, call before printer_send(). False (and an "Error:bridge: ..." line
-// to all clients) when the line must not go out now:
-//  - stopped (except PRINTER_SRC_CONSOLE, the debug console)
-//  - a home running (printer_state_home_xy/z)
-//  - laser build, no heaters: any heater target above 0 (M104/M109/M140/M190) and M303,
-//    Marlin would kill() on MINTEMP / heating failed
-//  - every G28, G29, G30, M48: they preheat for the Z probe, Marlin would kill() on MINTEMP
-//  - G0-G3 taking a homed axis outside 0..max (settings) of its switch (arcs: end point)
-// An allowed line also updates the tracked position (G90/G91, G92, moves).
-bool printer_state_allow(const char *line, printer_source_t source);
-
-// An allowed line didn't make it into the queue (full). The bridge already counted it, so the
-// homes are dropped (positions and G90/G91 no longer known) and an "Error:bridge:" line says so.
-void printer_state_dropped(const char *line);
+// The one way a client (console, web, later telnet / BLE / a job) sends a user line:
+//  - M108 / M410: printer_emergency() (queue cleared, sent at once). M112: the same from the
+//    console (Marlin kill()s: debugging), a soft STOP (printer_state_soft_stop) from the rest.
+//  - else the guard refuses it (an "Error:bridge: ..." line to all clients says why):
+//    - stopped (except PRINTER_SRC_CONSOLE, the debug console)
+//    - a home running (printer_state_home_xy/z)
+//    - laser build, no heaters: any heater target above 0 or preset (I) on M104/M109/M140/
+//      M190, and M303: Marlin would kill() on MINTEMP / heating failed
+//    - every G28, G29, G30, M48: they preheat for the Z probe, Marlin would kill() on MINTEMP
+//    - G0-G3 taking a homed axis outside 0..max (settings) of its switch (arcs: end point)
+//  - or it is queued (waiting up to wait), and tracked (G90/G91, G92, moves). A STOP between
+//    the guard and the queue drops it (printer_link epochs). A full queue drops it too, and
+//    the homes with it (positions no longer known), with an "Error:bridge:" line.
+// Returns 1 sent or queued, 0 refused, -1 queue full: a caller sending a batch stops there.
+int printer_state_submit(const char *line, printer_source_t source, TickType_t wait);
 
 // Show a bridge line ("echo:bridge: ..." / "Error:bridge: ...") to every client. The text
 // must not contain "kill" or "halted" (it would read as a Marlin kill).

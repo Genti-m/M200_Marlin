@@ -30,6 +30,12 @@
   <symbol id="i-printer" viewBox="0 0 24 24"><path d="M4 21V4h16v17M4 17h16M9 4v6h6V4M12 10v3"/></symbol>
   <symbol id="i-link" viewBox="0 0 24 24"><path d="M10 14a4 4 0 0 0 5.7 0l3-3a4 4 0 0 0-5.7-5.7l-1 1M14 10a4 4 0 0 0-5.7 0l-3 3a4 4 0 0 0 5.7 5.7l1-1"/></symbol>
   <symbol id="i-wifi" viewBox="0 0 24 24"><path d="M2 9a15 15 0 0 1 20 0M5 12.5a10 10 0 0 1 14 0M8.5 16a5 5 0 0 1 7 0M12 19.5h.01"/></symbol>
+  <symbol id="i-camera" viewBox="0 0 24 24"><path d="M3 8a2 2 0 0 1 2-2h2.5l1.5-2h6l1.5 2H19a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><circle cx="12" cy="13" r="3.5"/></symbol>
+  <symbol id="i-scan" viewBox="0 0 24 24"><path d="M4 8V5a1 1 0 0 1 1-1h3M16 4h3a1 1 0 0 1 1 1v3M20 16v3a1 1 0 0 1-1 1h-3M8 20H5a1 1 0 0 1-1-1v-3"/><path d="M8 9h3v3H8zM13 9h3v3h-3zM8 14h3v1M13 14h3v1"/></symbol>
+  <symbol id="i-images" viewBox="0 0 24 24"><rect x="3" y="4" width="15" height="13" rx="2"/><path d="M7 21h12a2 2 0 0 0 2-2V9"/><path d="M3 14l4-4 4 4 2.5-2.5L18 16"/></symbol>
+  <symbol id="i-pause" viewBox="0 0 24 24"><path d="M8 5v14M16 5v14"/></symbol>
+  <symbol id="i-expand" viewBox="0 0 24 24"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/></symbol>
+  <symbol id="i-sliders" viewBox="0 0 24 24"><path d="M4 6h10M18 6h2M4 12h4M12 12h8M4 18h12M20 18h0"/><circle cx="16" cy="6" r="2"/><circle cx="10" cy="12" r="2"/><circle cx="18" cy="18" r="2"/></symbol>
 </svg>
 <header class="top">
   <h1>M200</h1>
@@ -95,6 +101,35 @@
     <div class="muted" id="preset-hint">Home X Y first</div>
   </section>
 
+  <!-- Camera: an HTTP stream or snapshot URL, chosen in Setting tweaking (kept in this browser) -->
+  <section class="card camera" id="camera">
+    <h2><svg class="ic"><use href="#i-camera"/></svg>Camera <span class="muted" id="cam-status"></span>
+      <span class="cam-tools">
+        <button type="button" id="cam-scan" class="icon-btn" title="Scan the bed: photos in a grid, then one collage" aria-label="Scan the bed" aria-haspopup="dialog" hidden><svg class="ic"><use href="#i-scan"/></svg></button>
+        <button type="button" id="cam-collages" class="icon-btn" title="Last bed scans and their collages" aria-label="Last bed scans" aria-haspopup="dialog" hidden><svg class="ic"><use href="#i-images"/></svg></button>
+        <button type="button" id="cam-adjust" class="icon-btn" title="Camera settings: brightness, exposure, focus..." aria-label="Camera settings" aria-expanded="false" aria-controls="cam-ctl" hidden><svg class="ic"><use href="#i-sliders"/></svg></button>
+        <button type="button" id="cam-pause" class="icon-btn" title="Pause the camera (frees it for another viewer)" aria-label="Pause the camera"><svg class="ic"><use id="cam-pause-icon" href="#i-pause"/></svg></button>
+        <button type="button" id="cam-reload" class="icon-btn" title="Reconnect the camera" aria-label="Reconnect the camera"><svg class="ic"><use href="#i-refresh"/></svg></button>
+        <button type="button" id="cam-full" class="icon-btn" title="Full screen" aria-label="Full screen"><svg class="ic"><use href="#i-expand"/></svg></button>
+      </span>
+    </h2>
+    <div class="cam-box" id="cam-box">
+      <img id="cam-img" alt="Camera view" hidden>
+      <div class="cam-msg" id="cam-msg">
+        <span id="cam-msg-text">No camera chosen.</span>
+        <button type="button" id="cam-setup"><svg class="ic"><use href="#i-camera"/></svg>Choose a camera</button>
+      </div>
+    </div>
+    <!-- The camera's own settings, from the camera server's /controls (tools/usb_cam.py) -->
+    <div class="cam-ctl" id="cam-ctl" hidden>
+      <div class="rows" id="cam-ctl-rows"></div>
+      <div class="foot">
+        <span class="muted" id="cam-ctl-msg"></span>
+        <button type="button" id="cam-ctl-reset">Reset</button>
+      </div>
+    </div>
+  </section>
+
   <section class="card console">
     <h2><svg class="ic"><use href="#i-term"/></svg>Console
       <label class="toggle"><input type="checkbox" id="show-all"> show ok / reports</label>
@@ -122,6 +157,38 @@
     </div>
     <div class="sheet-body" id="settings-body"></div>
   </form>
+</dialog>
+<!-- Bed scan: run by the camera server on the PC (tools/usb_cam.py + scan_bed.py), not the bridge -->
+<dialog id="scan" class="sheet wide" aria-labelledby="scan-title">
+  <div class="sheet-wrap">
+    <div class="sheet-bar">
+      <button type="button" class="bar-btn" id="scan-close">Close</button>
+      <h3 id="scan-title" tabindex="-1">Bed scan</h3>
+      <button type="button" class="bar-btn strong" id="scan-go">Start</button>
+    </div>
+    <div class="sheet-body">
+      <p class="scan-msg" id="scan-msg" aria-live="polite"></p>
+      <div class="scan-grid" id="scan-grid"></div>
+      <div class="scan-result" id="scan-result" hidden>
+        <h4>Collage</h4>
+        <a id="scan-collage-link" target="_blank" rel="noopener" title="Open full size"><img id="scan-collage" alt="Collage of the bed"></a>
+      </div>
+      <ul class="scan-log" id="scan-log"></ul>
+    </div>
+  </div>
+</dialog>
+<dialog id="collages" class="sheet wide" aria-labelledby="collages-title">
+  <div class="sheet-wrap">
+    <div class="sheet-bar">
+      <button type="button" class="bar-btn" id="collages-close">Close</button>
+      <h3 id="collages-title" tabindex="-1">Bed scans</h3>
+      <button type="button" class="bar-btn strong" id="collages-reload">Reload</button>
+    </div>
+    <div class="sheet-body">
+      <p class="scan-msg" id="collages-msg"></p>
+      <div class="collage-list" id="collage-list"></div>
+    </div>
+  </div>
 </dialog>
 <script src="app.js"></script>
 </body>

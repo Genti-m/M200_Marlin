@@ -41,13 +41,18 @@ settings = {k: d[0] for k, d in SETTINGS_DESC.items()}  # the mock keeps them in
 def parse_gcode(line):
     """(word, {letter: value}) read like gcode_guard.c in the firmware: no spaces needed
     ("N12G28X", "M104S200", "G1X10Y200"), the first of each letter wins, ";" comments and
-    "*" checksums cut off, "nan" is a number. "G28.1" is not G28."""
+    "*" checksums cut off, "nan" is a number. "G28.1" is not G28. Spaces between letter and
+    number are skipped like Marlin does ("M 104 S200" is M104)."""
     cmd = re.sub(r";.*$|\*.*$", "", line).strip().upper()
-    cmd = re.sub(r"^N\d+\s*", "", cmd)
-    m = re.match(r"[GM]\d+(?![\d.])", cmd)
-    word = m.group(0) if m else (cmd.split(" ")[0] if cmd else "")
+    cmd = re.sub(r"^N\d+ *", "", cmd)
+    m = re.match(r"([GM]) *(\d+)(?![\d.])", cmd)
+    if m:
+        word, rest = m.group(1) + m.group(2), cmd[m.end():]
+    else:
+        word = cmd.split(" ")[0] if cmd else ""
+        rest = cmd[len(word):]
     args = {}
-    for k, v in re.findall(r"(?<![A-Z])([A-Z])\s*(-?(?:\d+\.?\d*|\.\d+)|NAN|INF)", cmd[len(word):]):
+    for k, v in re.findall(r"(?<![A-Z])([A-Z])\s*(-?(?:\d+\.?\d*|\.\d+)|NAN|INF)", rest):
         args.setdefault(k, float(v))
     return word, args
 
@@ -297,12 +302,13 @@ class FakeMarlin:
         return "ok"
 
     def refusal(self, line):
-        # same rules as printer_state_allow() in the firmware
+        # same rules as printer_state_submit() (the guard) in the firmware
         if self.stopped:
             return "Error:bridge: stopped, press RESTART first"
         word, a = parse_gcode(line)
         target = a.get("S", a.get("R"))
         heat = target is not None and not target <= 0  # NaN counts as heat, like the firmware
+        heat = heat or "I" in a  # material preset: wins over S in Marlin
         if word in ("M104", "M109", "M140", "M190") and heat:
             return "Error:bridge: laser build, no heaters: heating refused (S0 / off works)"
         if word == "M303":
@@ -421,7 +427,7 @@ def handle_ws_message(text):
     if m.get("t") == "gcode":
         for line in m.get("lines", [])[:20]:
             line = str(line)
-            if re.match(r"^\s*M112\b", line, re.I):
+            if re.match(r"^\s*M *112\b", line, re.I):
                 marlin.soft_stop()
             elif re.match(r"^\s*!kill\b", line, re.I):
                 marlin.kill()

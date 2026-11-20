@@ -20,11 +20,17 @@ int gcode_command_code(const char *line, char letter, const char **rest)
             line++;
         }
     }
-    if (toupper((unsigned char)*line) != letter || !isdigit((unsigned char)line[1])) {
+    if (toupper((unsigned char)*line) != letter) {
+        return -1;
+    }
+    line++;
+    while (*line == ' ') {  // Marlin skips them too: "M 104 S200" is M104
+        line++;
+    }
+    if (!isdigit((unsigned char)*line)) {
         return -1;
     }
     int code = 0;
-    line++;
     while (isdigit((unsigned char)*line)) {
         code = code * 10 + (*line++ - '0');
     }
@@ -58,6 +64,12 @@ bool gcode_heater_target(const char *rest, float *out)
     return gcode_num_param(rest, 'S', out) || gcode_num_param(rest, 'R', out);
 }
 
+int gcode_emergency_code(const char *line)
+{
+    int m = gcode_command_code(line, 'M', NULL);
+    return m == 112 || m == 108 || m == 410 ? m : 0;
+}
+
 float gcode_machine(const gcode_axis_t *a, float l)
 {
     return a->dir * (l - a->zero);
@@ -82,8 +94,10 @@ const char *gcode_refusal(const gcode_motion_t *m, const float max_mm[3], const 
     // Laser build: heaters and sensors are removed (road_Change.md ch. 1). Marlin kill()s
     // (MINTEMP / heating failed) as soon as a heater target is above 0, so none ever goes out.
     // Target 0 (off) is harmless and still passes: soft STOP sends it.
-    if ((mc == 104 || mc == 109 || mc == 140 || mc == 190) && gcode_heater_target(rest, &target) &&
-        !(target <= 0)) {  // also refuses "S nan"
+    // "I<n>" heats to material preset n (HAS_PREHEAT) and wins over S: refused whatever S says.
+    bool heater = mc == 104 || mc == 109 || mc == 140 || mc == 190;
+    if (heater && (gcode_num_param(rest, 'I', &target) ||
+                   (gcode_heater_target(rest, &target) && !(target <= 0)))) {  // also "S nan"
         return "Error:bridge: laser build, no heaters: heating refused (S0 / off works)";
     }
     if (mc == 303) {

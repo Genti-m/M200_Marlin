@@ -77,10 +77,10 @@ h2 .ic { width: 16px; height: 16px; margin-right: -2px; }
   grid-template-columns: repeat(3, minmax(0, 1fr));
 }
 .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 14px 16px; min-width: 0; }
-.console { grid-column: 1 / -1; }
+.console, .camera { grid-column: 1 / -1; }
 @media (max-width: 700px) {
   .grid { grid-template-columns: minmax(0, 1fr); padding: 12px; gap: 12px; }
-  .console { grid-column: auto; }
+  .console, .camera { grid-column: auto; }
   .jog { order: -1; }
   .top { gap: 10px; padding: 10px 12px; }
   .dot span, .dot { font-size: 12px; }
@@ -157,6 +157,51 @@ h2 .ic { width: 16px; height: 16px; margin-right: -2px; }
 .frame .lbl { position: absolute; left: 6px; top: 4px; font-size: 11px; color: var(--muted); }
 .frame.here { border-color: var(--ok); box-shadow: inset 0 0 0 1px var(--ok); }
 .frame.here .dot-at { background: var(--ok); }
+
+/* Camera row: the box is sized by app.js (fitCam) from the picture's own aspect and rotation */
+.cam-tools { margin-left: auto; display: inline-flex; gap: 2px; }
+.cam-tools .icon-btn { margin-left: 0; }
+.cam-tools[hidden] { display: none; }
+.cam-box {
+  position: relative; margin: 0 auto; width: 100%; height: 180px; overflow: hidden;
+  background: var(--log-bg); border: 1px solid var(--line); border-radius: 8px;
+}
+.cam-box img {
+  position: absolute; left: 50%; top: 50%; display: block; max-width: none;
+  transform-origin: center;
+}
+.cam-box img[hidden] { display: none; }
+.cam-msg {
+  position: absolute; inset: 0; display: flex; flex-direction: column; gap: 10px;
+  align-items: center; justify-content: center; padding: 12px; text-align: center;
+  color: var(--muted); font-size: 14px;
+}
+.cam-msg[hidden] { display: none; }
+.cam-msg button[hidden] { display: none; }
+.cam-box.paused img { opacity: .45; }
+.cam-box:fullscreen { border: 0; border-radius: 0; background: #000; }
+.cam-tools .icon-btn[aria-expanded="true"] { color: var(--accent); }
+/* Camera settings panel: name, slider, value, Auto */
+.cam-ctl { margin-top: 12px; }
+.cam-ctl[hidden] { display: none; }
+.cam-ctl .rows { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 4px 20px; }
+.ctl { display: grid; grid-template-columns: 7.5em minmax(0, 1fr) 3.4em 3.4em; gap: 8px; align-items: center; min-height: 32px; font-size: 13px; }
+.ctl .name { color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.ctl input[type=range] { width: 100%; padding: 0; margin: 0; border: 0; background: none; accent-color: var(--accent); }
+.ctl.is-auto input[type=range] { opacity: .45; }
+.ctl output { text-align: right; font: 12px ui-monospace, Consolas, monospace; }
+.ctl .auto { display: inline-flex; gap: 4px; align-items: center; font-size: 12px; color: var(--muted); cursor: pointer; }
+.ctl .auto input { padding: 0; margin: 0; accent-color: var(--accent); }
+.cam-ctl .foot { display: flex; gap: 8px; align-items: center; justify-content: space-between; margin-top: 8px; }
+.cam-ctl .foot button { padding: 4px 12px; font-size: 13px; }
+/* Camera group in the settings sheet: a URL field and segmented controls */
+.srow .url {
+  flex: 2; min-width: 0; text-align: right; border: 0; background: transparent; padding: 4px 2px;
+  font: 14px ui-monospace, Consolas, monospace; color: var(--text);
+}
+.srow .url:focus-visible { outline: 2px solid var(--accent); border-radius: 6px; }
+.srow .url:invalid { color: var(--err); }
+.srow.off { opacity: .45; }
 
 /* Console K3 */
 .toggle { margin-left: auto; text-transform: none; letter-spacing: 0; font-size: 13px; display: inline-flex; gap: 6px; align-items: center; cursor: pointer; }
@@ -239,4 +284,49 @@ h2 .ic { width: 16px; height: 16px; margin-right: -2px; }
   @keyframes sheet-in { from { transform: translateY(100%); } }
   .sheet-body { padding: 4px 12px calc(22px + env(safe-area-inset-bottom)); }
   .val input { width: 60px; }
+}
+/* Bed scan sheets: the tiles fill in like the bed (+Y up), then the collage; the last scans */
+.sheet.wide { width: min(980px, 100%); }
+.sheet-wrap { display: flex; flex-direction: column; width: 100%; min-height: 0; }
+.scan-msg { margin: 12px 2px 10px; font-size: 14px; }
+.scan-msg.err { color: var(--err); }
+.scan-msg:empty { display: none; }
+.scan-grid { display: grid; gap: 4px; margin: 0 auto; }
+.scan-cell {
+  position: relative; display: flex; align-items: center; justify-content: center; overflow: hidden;
+  background: var(--btn); border-radius: 6px; color: var(--muted); font-size: 13px;
+}
+.scan-cell img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
+.scan-cell .lbl {
+  position: absolute; left: 5px; bottom: 3px; z-index: 1; font-size: 11px; color: #fff;
+  text-shadow: 0 0 3px #000, 0 0 2px #000;
+}
+.scan-cell.moving { box-shadow: inset 0 0 0 3px var(--accent); }
+.scan-cell.moving::after {
+  content: ""; position: absolute; inset: 0; background: var(--accent-weak);
+  animation: scan-pulse 1s ease-in-out infinite alternate;
+}
+@keyframes scan-pulse { from { opacity: .2; } to { opacity: 1; } }
+.scan-cell.last::before { content: ""; position: absolute; inset: 0; z-index: 1; box-shadow: inset 0 0 0 3px var(--ok); border-radius: 6px; }
+.scan-result[hidden] { display: none; }
+.scan-result h4 { margin: 16px 2px 6px; font-size: 13px; color: var(--muted); font-weight: 600; text-transform: uppercase; letter-spacing: .05em; }
+.scan-result img { display: block; width: 100%; height: auto; border-radius: 8px; border: 1px solid var(--line); }
+.scan-log { list-style: none; margin: 12px 2px 0; padding: 0; font: 12px ui-monospace, Consolas, monospace; color: var(--muted); overflow-wrap: anywhere; }
+.scan-log:empty { display: none; }
+.collage-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 10px; }
+.collage-item {
+  display: flex; flex-direction: column; overflow: hidden; background: var(--card);
+  border: 1px solid var(--line); border-radius: 10px;
+}
+.collage-item .thumb { display: block; aspect-ratio: 1; overflow: hidden; background: var(--btn); }
+.collage-item .thumb img { display: block; width: 100%; height: 100%; object-fit: cover; }
+.collage-item .none { display: flex; height: 100%; align-items: center; justify-content: center; color: var(--muted); font-size: 13px; }
+.collage-item .meta { padding: 8px 10px 2px; font-size: 14px; font-weight: 600; }
+.collage-item .sub { padding: 0 10px; font-size: 12px; color: var(--muted); }
+.collage-item .links { display: flex; gap: 14px; padding: 6px 10px 10px; font-size: 13px; }
+.collage-item a { color: var(--accent); text-decoration: none; }
+.collage-item a:hover { text-decoration: underline; }
+@media (max-width: 700px) {
+  .collage-list { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+  .scan-cell .lbl { font-size: 10px; }
 }

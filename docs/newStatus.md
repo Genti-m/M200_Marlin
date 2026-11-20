@@ -1,7 +1,8 @@
 # Zortrax M200 WiFi bridge - status and plan
 
 Updated: 2026-11-19
-Drawing: `drawings/Status and plan.excalidraw`
+Drawing: `Zortrax M200 plan.excalidraw` (outside the repo, in the parent `Zortrax M200` folder)
+Laser conversion, step by step: [../firmware/bridge/road_Change.md](../firmware/bridge/road_Change.md)
 
 ## Where we are
 
@@ -15,7 +16,8 @@ Drawing: `drawings/Status and plan.excalidraw`
 | DEBUG pin 1 | 3.3 V: **do not use** (don't power the ESP32 from it) |
 | DEBUG pins 2, 5, 6, 8 | BOOT0, SWD, RESET: **never connect** |
 
-All the hardware facts are confirmed. Next comes the ESP32-S3 firmware.
+All the hardware facts are confirmed. The bridge firmware runs (milestones 1-4); the printer is
+being converted into a laser engraver (heaters out, no `G28`), see `road_Change.md`.
 
 ## Wiring (printer OFF while connecting)
 
@@ -70,7 +72,7 @@ tools/run_host_tests.sh          PC unit tests (also run by .github/workflows/ci
 | 1 | ESP-IDF setup | **done** 2026-11-18 (IDF v6.1.1, flashed over native USB COM7, heartbeat on monitor) |
 | 2 | UART bridge | **done** 2026-11-18 (`M115` answered both ways, caps in `marlin_caps.md`) |
 | 3 | WiFi + mDNS | **code done** 2026-11-18, builds; test on hardware: `ping m200.local` works, credentials stored in NVS |
-| 4 | **Web interface** | **code done** 2026-11-18, builds; test on hardware: `http://m200.local`: temps, Home / Motors off / Preheat / STOP buttons, live console |
+| 4 | **Web interface** | **code done** 2026-11-18, builds; test on hardware: `http://m200.local`: Home X Y / Home Z (bridge homing, no `G28`), jog, preset frames, Motors off, STOP, live console (laser build: no heating) |
 | 5 | Telnet + BLE (not started) | `telnet m200.local 23` and nRF Connect both send `M105` and see the reply |
 | 6 | Printing from SD | file list (`M20`), start (`M23` + `M24`), pause/resume, progress bar (`M27`) |
 | 7 | Install | buck converter, case inside the base. Access token on the web API: **code done** 2026-11-19 (`!token`, see `protocol.md`) |
@@ -82,14 +84,14 @@ tools/run_host_tests.sh          PC unit tests (also run by .github/workflows/ci
    Wait for `connected, IP 192.168.x.y -> http://m200.local`. `!net` shows the status at any time, `!help` lists the commands.
 3. PC: `ping m200.local`, then open `http://m200.local` (if `.local` doesn't resolve on Windows, use the IP).
 4. Printer on: temps appear in about 2 s (`M155 S2` is sent at boot and after every printer reset).
-5. Check: Home -> "homed" badge, jog 1 mm, Set/Off on hotend and bed, console quick buttons, STOP (tap twice).
+5. Check: Home X Y and Home Z -> "homed" badges, jog 1 mm, console quick buttons, STOP (tap twice).
 6. Set an API token: `!token <secret>` (OTA is refused without one). From then on firmware updates can go over WiFi:
    `curl -H "X-Token: <secret>" --data-binary @build/m200_bridge.bin http://m200.local/api/ota`.
    A new image that gets no WiFi within 120 s is rolled back (needs the rollback bootloader: one USB flash after a fresh `sdkconfig`, see `road_Change.md` ch. 7).
 
 UI changes without the printer: `python tools/mock_bridge.py` -> http://localhost:8080 (same protocol, fake Marlin).
 
-## Hardware test checklist (road_Change.md ch. 5-7: built, not flashed yet)
+## Hardware test checklist (road_Change.md ch. 5-7 and 9: built, not flashed yet)
 
 Tick each one on the printer, in this order. Printer on, nothing on the bed.
 
@@ -113,15 +115,22 @@ Tick each one on the printer, in this order. Printer on, nothing on the bed.
 - [ ] Jog 10 mm each way; a jog past 170 is refused with an `Error:bridge:` line
 - [ ] A plain move into an endstop with `M120` on stops there, and Marlin keeps answering
 - [ ] `G28`, `M104 S200`, `M104S200`, `N5G28` from the console: all refused
+- [ ] `M 104 S200`, `G 28`, `M104 I0`, `M140 I1` (ch. 9): all refused, no heat target shows up
 - [ ] STOP during a Z home: home aborts, `RESTART` needed, axes unhomed
+- [ ] STOP during an X/Y home: no move after the STOP; log may show `dropped "...": queued before an emergency command`
+- [ ] `M410` typed in the web console during an X/Y home: home aborts, then `G1 X5` in `G90`
+      goes to X5 (Marlin back in absolute mode, `G90` / `M121` sent by the bridge)
 
 ## Open points (small)
 - ~~`Hardcoded Default Settings Loaded`: try `M500`~~ -> `Cap:EEPROM:0`, this build can't save settings (see `marlin_caps.md`).
-- `Cap:EMERGENCY_PARSER:0`: STOP (`M112`) only runs after the current command. Marlin 2.x sends busy as `echo:busy: processing`; `marlin_proto` now treats that as BUSY (it was ECHO, so the `ok` timeout never restarted). Confirm during a real `G28`.
+- `Cap:EMERGENCY_PARSER:0`: STOP (`M112`) only runs after the current command. Marlin 2.x sends busy as `echo:busy: processing`; `marlin_proto` now treats that as BUSY (it was ECHO, so the `ok` timeout never restarted). Confirm during a long move (`G28` is refused in the laser build): if no `busy:` lines come, the 15 s `ok` timeout must cover the slowest single command.
 - Pick the buck converter after measuring the PSU voltage (24 V expected).
 - API token done (web + REST, `!token`). Telnet, when it comes (milestone 5), must use it too. Still home network only: no TLS.
 
 ## Reference files
-- `howToWifi.md`: full background, the Arduino version of the bridge, BLE usage.
-- `pinout.md`: all measurements and pinouts.
-- `uart_finder/`, `pin_scanner/`: Nano test sketches (not needed anymore).
+- `marlin_caps.md`: the printer's `M115` answer and what each capability means for the bridge.
+- `protocol.md`: WebSocket + REST protocol, authentication.
+- `esps32Plan.md`: the original structure plan (some parts, like telnet first, changed since).
+- `../firmware/bridge/road_Change.md`: the laser conversion, one chapter per finished step.
+- The early notes (`howToWifi.md`, `pinout.md`) and the Nano sketches (`uart_finder/`,
+  `pin_scanner/`) are not in this repo; the pinout facts that matter are in the tables above.

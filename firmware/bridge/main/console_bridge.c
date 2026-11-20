@@ -6,7 +6,6 @@
 
 #include "driver/usb_serial_jtag.h"
 #include "driver/usb_serial_jtag_vfs.h"
-#include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_system.h"
@@ -14,8 +13,6 @@
 #include "printer_state.h"
 #include "web_server.h"
 #include "wifi_link.h"
-
-static const char *TAG = "console";
 
 static void echo(const char *s, size_t len)
 {
@@ -180,14 +177,9 @@ static void submit(const char *line)
         bridge_command(line + 1);
         return;
     }
-    if (printer_is_emergency_command(line)) {
-        printer_emergency(line, PRINTER_SRC_CONSOLE);
-    } else if (!printer_state_allow(line, PRINTER_SRC_CONSOLE)) {
-        return;  // the reason is printed as an "Error:bridge:" line
-    } else if (printer_send(line, PRINTER_SRC_CONSOLE, pdMS_TO_TICKS(100)) != ESP_OK) {
-        ESP_LOGW(TAG, "queue full, dropped: %s", line);
-        printer_state_dropped(line);
-    }
+    // A refusal or a full queue is printed as an "Error:bridge:" line. M112 goes to Marlin as
+    // is from here (kill(), for debugging), unlike the web page's soft STOP.
+    printer_state_submit(line, PRINTER_SRC_CONSOLE, pdMS_TO_TICKS(100));
 }
 
 static void console_task(void *arg)

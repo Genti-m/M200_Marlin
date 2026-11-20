@@ -1,6 +1,5 @@
 #include "printer_link.h"
 
-#include <ctype.h>
 #include <string.h>
 
 #include "driver/gpio.h"
@@ -28,10 +27,12 @@ ESP_EVENT_DEFINE_BASE(PRINTER_EVENT);
 
 typedef struct {
     printer_source_t source;
+    uint32_t epoch;
     char text[PRINTER_LINE_MAX];
 } tx_item_t;
 
 static QueueHandle_t s_queue;
+static uint32_t s_epoch;  // +1 on every printer_emergency(), __atomic access
 static TaskHandle_t s_tx_task;
 static volatile printer_link_state_t s_state = PRINTER_LINK_UNKNOWN;
 
@@ -121,6 +122,11 @@ static void tx_task(void *arg)
 
     for (;;) {
         xQueueReceive(s_queue, &item, portMAX_DELAY);
+        if (item.epoch != printer_link_epoch()) {
+            // Queued for a decision made before the last STOP / emergency: never send it.
+            ESP_LOGW(TAG, "dropped \"%s\": queued before an emergency command", item.text);
+            continue;
+        }
 
         // Forget any "ok" that arrived while nothing was in flight.
         ulTaskNotifyValueClear(NULL, NOTIFY_ALL);
@@ -195,14 +201,25 @@ esp_err_t printer_link_start(void)
     return ESP_OK;
 }
 
-esp_err_t printer_send(const char *line, printer_source_t source, TickType_t wait)
+uint32_t printer_link_epoch(void)
+{
+    return __atomic_load_n(&s_epoch, __ATOMIC_SEQ_CST);
+}
+
+esp_err_t printer_send_at(const char *line, printer_source_t source, TickType_t wait,
+                          uint32_t epoch)
 {
     if (!s_queue || !line) {
         return ESP_ERR_INVALID_STATE;
     }
-    tx_item_t item = {.source = source};
+    tx_item_t item = {.source = source, .epoch = epoch};
     strlcpy(item.text, line, sizeof(item.text));
     return xQueueSend(s_queue, &item, wait) == pdTRUE ? ESP_OK : ESP_ERR_TIMEOUT;
+}
+
+esp_err_t printer_send(const char *line, printer_source_t source, TickType_t wait)
+{
+    return printer_send_at(line, source, wait, printer_link_epoch());
 }
 
 esp_err_t printer_emergency(const char *line, printer_source_t source)
@@ -212,34 +229,14 @@ esp_err_t printer_emergency(const char *line, printer_source_t source)
     }
     // This Marlin has no EMERGENCY_PARSER (see docs/marlin_caps.md): it runs M112 only after
     // the current command. Drop everything still waiting here so we add no extra delay.
+    // The new epoch also drops lines that a task is about to queue for an older decision.
+    __atomic_add_fetch(&s_epoch, 1, __ATOMIC_SEQ_CST);
     UBaseType_t dropped = uxQueueMessagesWaiting(s_queue);
     xQueueReset(s_queue);
     uart_write_line(line);  // uart_write_bytes is thread-safe
     ESP_LOGW(TAG, "emergency: %s (%u queued commands dropped)", line, (unsigned)dropped);
     post_tx(line, source, true);
     return ESP_OK;
-}
-
-bool printer_is_emergency_command(const char *line)
-{
-    while (*line == ' ') {
-        line++;
-    }
-    if (toupper((unsigned char)line[0]) != 'M') {
-        return false;
-    }
-    int code = 0;
-    const char *p = line + 1;
-    if (!isdigit((unsigned char)*p)) {
-        return false;
-    }
-    while (isdigit((unsigned char)*p)) {
-        code = code * 10 + (*p++ - '0');
-    }
-    if (*p != '\0' && *p != ' ') {
-        return false;
-    }
-    return code == 112 || code == 108 || code == 410;
 }
 
 printer_link_state_t printer_link_get_state(void)
@@ -260,8 +257,8 @@ uint32_t printer_link_queue_free(void)
 const char *printer_link_state_name(printer_link_state_t state)
 {
     switch (state) {
-    case PRINTER_LINK_UP:       return "UP";
-    case PRINTER_LINK_NO_REPLY: return "NO_REPLY";
-    default:                    return "UNKNOWN";
+    case PRINTER_LINK_UP:       return "up";
+    case PRINTER_LINK_NO_REPLY: return "no_reply";
+    default:                    return "unknown";
     }
 }

@@ -1,7 +1,12 @@
 # ESP32-S3 firmware - how to start, organized for growth
 
 Updated: 2026-11-18
-Builds on: `newStatus.md` (hardware confirmed, milestones 0-7) and `drawings/Zortrax M200 project.excalidraw` (camera head, bed sensors, measurement flow).
+Builds on: `newStatus.md` (hardware confirmed, milestones 0-7) and the drawing `Zortrax M200 plan.excalidraw` (outside the repo, in the parent folder: camera head, bed sensors, measurement flow).
+
+> This is the original plan. The code follows its structure (queue in, event bus out), but
+> details changed since: the printer became a laser engraver, the web UI came before telnet,
+> and a client now sends user G-code through `printer_state_submit()` (guard, epochs), not
+> `printer_send()` directly. What was really built: `newStatus.md` and `firmware/bridge/road_Change.md`.
 
 The goal of this file: start the ESP32-S3 project in a way that still works when the project has a web UI, telnet, BLE, OTA, sensors, a measurement flow and a second ESP32 (the camera head).
 

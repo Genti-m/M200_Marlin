@@ -52,7 +52,8 @@ function connect() {
     else if (m.t === "hello") {
       document.title = (m.name || "M200") + " Bridge";
       (m.history || []).forEach(addLine);
-      if (m.auth === "required") login(false);
+      authRequired = m.auth === "required";
+      if (authRequired) login(false);
     }
   };
 }
@@ -60,6 +61,7 @@ function connect() {
 // ---------- Login (API token, set on the USB console with !token) ----------
 // Viewing is open; commands need the token once one is set. STOP never needs it.
 const TOKEN_KEY = "m200.token";
+let authRequired = false;  // the bridge's hello said a token is set
 function savedToken() { try { return localStorage.getItem(TOKEN_KEY) || ""; } catch { return ""; } }
 function login(ask) {
   let tok = ask ? "" : savedToken();
@@ -379,6 +381,268 @@ function disarm() {
   stopBtn.classList.remove("arm");
 }
 
+// ---------- Camera: a picture from any HTTP camera on the network ----------
+// Chosen in Setting tweaking and kept in this browser (localStorage), not on the bridge: each
+// phone / PC picks its own. "stream": an MJPEG URL shown live (ESP32-CAM: http://<cam>:81/stream,
+// mjpg-streamer: ?action=stream). "snap": a JPEG URL loaded again every `every` seconds.
+// The viewing device's own camera can't be used: browsers allow that only on https.
+const CAM_KEY = "m200.camera";
+const CAM_DEFAULT = { mode: "off", url: "", every: 2, rot: 0, flip: false };
+const CAM_MAX_H = 420;  // px, outside full screen
+function loadCam() {
+  try { return Object.assign({}, CAM_DEFAULT, JSON.parse(localStorage.getItem(CAM_KEY) || "{}")); }
+  catch { return Object.assign({}, CAM_DEFAULT); }
+}
+let cam = loadCam();
+const camCard = $("#camera"), camBox = $("#cam-box"), camImg = $("#cam-img");
+let camPaused = false;
+let camWant = false;      // a picture is being loaded on purpose: errors after camStop() don't count
+let camTimer = 0;         // next snapshot, or the next retry
+let camWatch = 0;         // stream: waits for the first frame (not every browser fires "load")
+let camRatio = 4 / 3;     // the picture's width / height, known after its first frame
+
+const camUrlOk = (u) => /^https?:\/\/\S+$/i.test(u || "");
+const camOn = () => cam.mode !== "off" && camUrlOk(cam.url);
+
+function camMessage(text, setup) {
+  $("#cam-msg").hidden = !text;
+  $("#cam-msg-text").textContent = text || "";
+  $("#cam-setup").hidden = !setup;
+}
+
+function camStop() {
+  camWant = false;
+  clearTimeout(camTimer);
+  clearInterval(camWatch);
+  camImg.removeAttribute("src");  // ends a stream: many cameras allow one viewer at a time
+}
+
+function camStart() {
+  camStop();
+  const on = camOn();
+  $(".cam-tools").hidden = !on;
+  if (camCtlUrl && camCtlUrl !== camCtlFor()) camCtlShowButton("");  // another camera chosen
+  if (scanUrl && scanUrl !== scanBase()) scanShowButtons("");
+  camBox.classList.toggle("paused", camPaused);
+  $("#cam-pause-icon").setAttribute("href", camPaused ? "#i-play" : "#i-pause");
+  $("#cam-pause").title = camPaused ? "Resume the camera" : "Pause the camera (frees it for another viewer)";
+  if (!on) {
+    camImg.hidden = true;
+    camMessage(cam.mode === "off" ? "No camera chosen." : "The camera URL must start with http:// or https://", true);
+    $("#cam-status").textContent = "";
+    fitCam();
+    return;
+  }
+  if (camPaused || document.hidden) {
+    $("#cam-status").textContent = "paused";
+    if (camImg.hidden) camMessage("Paused.", false);
+    return;
+  }
+  $("#cam-status").textContent = "connecting...";
+  if (camImg.hidden) camMessage("Connecting to " + cam.url, false);
+  camWant = true;
+  camImg.src = cam.mode === "snap" ? camSnapUrl() : cam.url;
+  if (cam.mode === "stream") camWatch = setInterval(() => { if (camImg.naturalWidth) camShown(); }, 500);
+}
+const camSnapUrl = () => cam.url + (cam.url.includes("?") ? "&" : "?") + "_t=" + Date.now();
+// The next snapshot replaces the shown one once it has loaded: no blank frame in between.
+function camNextSnap() { if (camWant) camImg.src = camSnapUrl(); }
+
+function camShown() {
+  if (!camWant) return;
+  clearInterval(camWatch);
+  if (camImg.naturalWidth && camImg.naturalHeight) camRatio = camImg.naturalWidth / camImg.naturalHeight;
+  camImg.hidden = false;
+  camMessage("");
+  fitCam();
+  if (camCtlFor() !== camCtlTried) { camCtlTried = camCtlFor(); camCtlLoad(); scanProbe(); }
+  if (cam.mode === "snap") {
+    $("#cam-status").textContent = `snapshot every ${cam.every} s`;
+    clearTimeout(camTimer);
+    camTimer = setTimeout(camNextSnap, cam.every * 1000);
+  } else {
+    $("#cam-status").textContent = "live";
+  }
+}
+camImg.addEventListener("load", camShown);
+camImg.addEventListener("error", () => {
+  if (!camWant) return;
+  camStop();
+  camCtlTried = "";  // the server may come back as another program
+  camImg.hidden = true;
+  camMessage("Camera not reachable: " + cam.url, false);
+  $("#cam-status").textContent = "offline, retrying";
+  camTimer = setTimeout(camStart, Math.max(5, cam.every) * 1000);
+  fitCam();
+});
+
+// Size the box from the picture's aspect and rotation: as wide as the card, at most CAM_MAX_H
+// high (the whole screen in full screen). The picture is centered and turned with a transform.
+function fitCam() {
+  const rot = (((Number(cam.rot) || 0) % 360) + 360) % 360;
+  const side = rot === 90 || rot === 270;
+  const full = document.fullscreenElement === camBox;
+  if (camImg.hidden && !full) { camBox.style.width = ""; camBox.style.height = ""; return; }
+  const cs = getComputedStyle(camCard);
+  const availW = full ? innerWidth : camCard.clientWidth - parseFloat(cs.paddingLeft) - parseFloat(cs.paddingRight);
+  const maxH = full ? innerHeight : Math.min(CAM_MAX_H, innerHeight * 0.6);
+  const r = side ? 1 / camRatio : camRatio;  // shown width / height
+  const h = Math.max(1, Math.min(availW / r, maxH));
+  const w = h * r;
+  if (!full) { camBox.style.width = w + "px"; camBox.style.height = h + "px"; }
+  camImg.style.width = (side ? h : w) + "px";
+  camImg.style.height = (side ? w : h) + "px";
+  camImg.style.transform = `translate(-50%, -50%) rotate(${rot}deg) scaleX(${cam.flip ? -1 : 1})`;
+}
+
+$("#cam-pause").addEventListener("click", () => { camPaused = !camPaused; camStart(); });
+$("#cam-reload").addEventListener("click", () => { camPaused = false; camStart(); });
+$("#cam-full").addEventListener("click", () => {
+  if (document.fullscreenElement) document.exitFullscreen();
+  else if (camBox.requestFullscreen) camBox.requestFullscreen().catch(() => {});
+});
+document.addEventListener("fullscreenchange", fitCam);
+document.addEventListener("visibilitychange", camStart);  // a hidden tab doesn't hold the stream
+if (window.ResizeObserver) new ResizeObserver(fitCam).observe(camCard);
+else window.addEventListener("resize", fitCam);
+
+// ---------- Camera settings: brightness, exposure, white balance, focus, zoom... ----------
+// Only for a camera server with a /controls API (tools/usb_cam.py: the same settings as the
+// camera maker's app). Asked straight from the camera's address, never through the bridge.
+// Other cameras: no sliders button. Every viewer changes the same camera.
+let camCtlUrl = "";       // the /controls that answered ("" = none: no button)
+let camCtlTried = "";     // asked once per camera (and again after it was offline)
+let camCtlBusy = false;   // a POST is on its way: changes made meanwhile wait in camCtlNext
+let camCtlNext = null;
+let camCtlTimer = 0;
+const camCtlEls = {};     // key -> { row, range, out, auto }
+
+const camCtlFor = () => { try { return camOn() ? new URL(cam.url).origin + "/controls" : ""; } catch { return ""; } };
+const camCtlOpen = () => !$("#cam-ctl").hidden;
+function camCtlMsg(t) { $("#cam-ctl-msg").textContent = t || ""; }
+
+function camCtlShowButton(url) {
+  camCtlUrl = url;
+  $("#cam-adjust").hidden = !url;
+  if (!url) { $("#cam-ctl").hidden = true; $("#cam-adjust").setAttribute("aria-expanded", "false"); }
+}
+
+// Ask the camera server for its settings; shows the button if it has them.
+async function camCtlLoad() {
+  const url = camCtlFor();
+  if (!url) { camCtlShowButton(""); return; }
+  try {
+    const r = await fetch(url, { cache: "no-store" });
+    const js = await r.json();
+    if (url !== camCtlFor()) return;  // the camera was changed meanwhile
+    if (!r.ok || !Array.isArray(js.controls) || !js.controls.length) throw new Error();
+    camCtlShowButton(url);
+    camCtlRender(js.controls);
+    camCtlMsg("");
+  } catch {
+    if (url !== camCtlFor()) return;
+    if (camCtlOpen()) camCtlMsg("Camera settings not reachable.");
+    else camCtlShowButton("");
+  }
+}
+
+function camCtlRender(list) {
+  const rows = $("#cam-ctl-rows");
+  const keys = list.map((c) => c.key).join();
+  if (rows.dataset.keys !== keys) {  // build once per camera; afterwards only the values change
+    rows.textContent = "";
+    for (const k in camCtlEls) delete camCtlEls[k];
+    for (const c of list) rows.appendChild(camCtlRow(c));
+    rows.dataset.keys = keys;
+  }
+  for (const c of list) {
+    const e = camCtlEls[c.key];
+    if (!e || (camCtlNext && c.key in camCtlNext) || document.activeElement === e.range) continue;
+    e.range.min = c.min; e.range.max = c.max; e.range.value = c.value;
+    e.out.value = c.value;
+    if (e.auto) e.auto.checked = !!c.auto;
+    e.row.classList.toggle("is-auto", !!c.auto);
+  }
+}
+
+function camCtlRow(c) {
+  const row = document.createElement("div");
+  row.className = "ctl";
+  const id = "cam-ctl-" + c.key;
+  const name = document.createElement("label");
+  name.className = "name"; name.htmlFor = id; name.textContent = c.label; name.title = c.label;
+  const range = document.createElement("input");
+  range.type = "range"; range.id = id; range.step = 1;
+  const out = document.createElement("output");
+  out.htmlFor = id;
+  row.append(name, range, out);
+  const e = { row, range, out, auto: null };
+  range.addEventListener("input", () => {
+    out.value = range.value;
+    if (e.auto) { e.auto.checked = false; row.classList.remove("is-auto"); }  // a value means manual
+    camCtlSend({ [c.key]: { value: Number(range.value) } });
+  });
+  if ("auto" in c) {
+    const lab = document.createElement("label");
+    lab.className = "auto";
+    const box = document.createElement("input");
+    box.type = "checkbox";
+    box.addEventListener("change", () => {
+      row.classList.toggle("is-auto", box.checked);
+      camCtlSend({ [c.key]: { auto: box.checked } });
+    });
+    lab.append(box, "Auto");
+    row.appendChild(lab);
+    e.auto = box;
+  } else {
+    row.appendChild(document.createElement("span"));
+  }
+  camCtlEls[c.key] = e;
+  return row;
+}
+
+// Changes go out at most one request at a time; slider moves in between are merged.
+function camCtlSend(change) {
+  camCtlNext = camCtlNext || {};
+  for (const k in change) camCtlNext[k] = Object.assign({}, camCtlNext[k], change[k]);
+  clearTimeout(camCtlTimer);
+  camCtlTimer = setTimeout(camCtlFlush, 80);
+}
+async function camCtlFlush() {
+  if (camCtlBusy || !camCtlNext || !camCtlUrl) return;
+  const body = camCtlNext;
+  camCtlNext = null;
+  await camCtlPost(body);
+  if (camCtlNext) camCtlFlush();
+}
+async function camCtlPost(body) {
+  camCtlBusy = true;
+  try {
+    // text/plain keeps it a "simple" request: no CORS preflight to the camera server
+    const r = await fetch(camCtlUrl, { method: "POST", body: JSON.stringify(body) });
+    const js = await r.json();
+    if (!r.ok || !Array.isArray(js.controls)) throw new Error();
+    camCtlRender(js.controls);
+    camCtlMsg("");
+  } catch {
+    camCtlMsg("Not saved: camera settings not reachable.");
+  } finally {
+    camCtlBusy = false;
+  }
+}
+
+$("#cam-adjust").addEventListener("click", () => {
+  const open = !camCtlOpen();
+  $("#cam-ctl").hidden = !open;
+  $("#cam-adjust").setAttribute("aria-expanded", String(open));
+  if (open) camCtlLoad();  // fresh values: another viewer may have changed them
+});
+$("#cam-ctl-reset").addEventListener("click", () => {
+  clearTimeout(camCtlTimer);
+  camCtlNext = null;
+  camCtlPost({ reset: true });
+});
+
 // ---------- Setting tweaking: an iOS-style sheet, values kept by the bridge (NVS) ----------
 // type: "num" (field + stepper) or "dir" (segmented control). The range, default and step
 // come from the bridge ("d" in its settings message).
@@ -403,6 +667,114 @@ let saving = false;
 const decimals = (st) => (String(st).split(".")[1] || "").length;
 const fmt = (k, v) => Number(v).toFixed(decimals((cfgDesc[k] || [0, 0, 0, 1])[3]));
 
+// Segmented control: opts = [[value, label], ...]; .value reads / sets the pressed one.
+function makeSeg(id, opts, onChange) {
+  const seg = document.createElement("div");
+  seg.className = "seg"; seg.id = id; seg.setAttribute("role", "group");
+  for (const [v, label] of opts) {
+    const b = document.createElement("button");
+    b.type = "button"; b.dataset.v = v; b.textContent = label;
+    b.addEventListener("click", () => { seg.value = v; onChange(); });
+    seg.appendChild(b);
+  }
+  Object.defineProperty(seg, "value", {
+    get() { return seg.dataset.v; },
+    set(v) { seg.dataset.v = String(v); seg.querySelectorAll("button").forEach((b) => b.setAttribute("aria-pressed", String(b.dataset.v === String(v)))); },
+  });
+  return seg;
+}
+
+// The Camera group: kept in this browser, saved with the sheet's Save (also offline).
+const camInputs = {};
+let camGroupTitle = null;
+function srow(label, forId) {
+  const row = document.createElement("div");
+  row.className = "srow";
+  const dot = document.createElement("span");
+  dot.className = "changed";  // never shown: keeps the labels in line with the other groups
+  const l = document.createElement("label");
+  l.textContent = label;
+  if (forId) l.htmlFor = forId;
+  row.append(dot, l);
+  return row;
+}
+function buildCamGroup() {
+  camGroupTitle = document.createElement("div");
+  camGroupTitle.className = "group-title"; camGroupTitle.textContent = "Camera";
+  const box = document.createElement("div");
+  box.className = "group";
+
+  const rMode = srow("Source");
+  camInputs.mode = makeSeg("cam-mode", [["off", "Off"], ["stream", "Stream"], ["snap", "Snapshot"]], camRowsState);
+  rMode.appendChild(camInputs.mode);
+
+  const rUrl = srow("URL", "cam-url");
+  const url = document.createElement("input");
+  url.id = "cam-url"; url.className = "url"; url.type = "url"; url.inputMode = "url";
+  url.autocomplete = "off"; url.spellcheck = false; url.pattern = "https?://\\S+";
+  url.placeholder = "http://camera.local:81/stream";
+  rUrl.appendChild(url);
+  camInputs.url = url;
+
+  const rEvery = srow("Snapshot every", "cam-every");
+  const val = document.createElement("span");
+  val.className = "val";
+  const every = document.createElement("input");
+  every.id = "cam-every"; every.type = "number"; every.inputMode = "numeric";
+  every.min = 1; every.max = 60; every.step = 1; every.placeholder = String(CAM_DEFAULT.every);
+  val.append(every, "s");
+  rEvery.appendChild(val);
+  camInputs.every = every;
+
+  const rRot = srow("Rotate");
+  camInputs.rot = makeSeg("cam-rot", [["0", "0°"], ["90", "90°"], ["180", "180°"], ["270", "270°"]], () => {});
+  rRot.appendChild(camInputs.rot);
+
+  const rFlip = srow("Mirror");
+  camInputs.flip = makeSeg("cam-flip", [["0", "Off"], ["1", "On"]], () => {});
+  rFlip.appendChild(camInputs.flip);
+
+  box.append(rMode, rUrl, rEvery, rRot, rFlip);
+  camInputs.rows = { url: rUrl, every: rEvery, rot: rRot, flip: rFlip };
+  const f = document.createElement("div");
+  f.className = "group-foot";
+  f.textContent = "Saved in this browser only: each phone / PC picks its own. Any camera that serves "
+    + "a picture over http works: an ESP32-CAM stream is usually http://<camera>:81/stream, a "
+    + "snapshot http://<camera>/capture. Many cameras allow one viewer at a time: pause frees it. "
+    + "A USB camera served by tools/usb_cam.py also gets a sliders button for its own settings.";
+  sheetBody.append(camGroupTitle, box, f);
+}
+function camRowsState() {
+  const mode = camInputs.mode.value;
+  for (const k of ["url", "rot", "flip"]) camInputs.rows[k].classList.toggle("off", mode === "off");
+  camInputs.rows.every.classList.toggle("off", mode !== "snap");
+}
+function fillCamInputs() {
+  camInputs.mode.value = cam.mode;
+  camInputs.url.value = cam.url;
+  camInputs.every.value = cam.every;
+  camInputs.rot.value = String(cam.rot);
+  camInputs.flip.value = cam.flip ? "1" : "0";
+  camRowsState();
+}
+// The camera from the sheet, or a reason it can't be saved.
+function readCamInputs() {
+  const mode = camInputs.mode.value;
+  const url = camInputs.url.value.trim();
+  if (mode !== "off" && !camUrlOk(url)) return { why: "Camera URL must start with http:// or https://" };
+  const every = Math.round(Number(camInputs.every.value));
+  return {
+    cam: { mode, url, every: every >= 1 && every <= 60 ? every : CAM_DEFAULT.every,
+      rot: Number(camInputs.rot.value) || 0, flip: camInputs.flip.value === "1" },
+  };
+}
+function saveCam(c) {
+  const changed = JSON.stringify(c) !== JSON.stringify(cam);
+  cam = c;
+  try { localStorage.setItem(CAM_KEY, JSON.stringify(cam)); } catch {}
+  if (changed) { camPaused = false; camStart(); }
+}
+
 function buildSheet() {
   sheetBody.textContent = "";
   for (const g of SETTING_GROUPS) {
@@ -416,14 +788,7 @@ function buildSheet() {
       const id = "set-" + key;
       row.innerHTML = `<span class="changed" title="not the default"></span><label for="${id}">${label}</label>`;
       if (type === "dir") {
-        const seg = document.createElement("div");
-        seg.className = "seg"; seg.id = id; seg.setAttribute("role", "group");
-        seg.innerHTML = `<button type="button" data-v="-1">−Z</button><button type="button" data-v="1">+Z</button>`;
-        Object.defineProperty(seg, "value", {
-          get() { return seg.dataset.v; },
-          set(v) { seg.dataset.v = String(v); seg.querySelectorAll("button").forEach((b) => b.setAttribute("aria-pressed", String(b.dataset.v === String(v)))); },
-        });
-        seg.querySelectorAll("button").forEach((b) => b.addEventListener("click", () => { seg.value = b.dataset.v; markChanged(key); }));
+        const seg = makeSeg(id, [["-1", "−Z"], ["1", "+Z"]], () => markChanged(key));
         row.appendChild(seg);
         inputs[key] = seg;
       } else {
@@ -449,6 +814,7 @@ function buildSheet() {
     f.className = "group-foot"; f.textContent = g.foot;
     sheetBody.append(t, box, f);
   }
+  buildCamGroup();
   const reset = document.createElement("div");
   reset.className = "group";
   reset.style.marginTop = "22px";
@@ -459,7 +825,7 @@ function buildSheet() {
   sheetBody.prepend(sheetMsg);  // on top: offline note, save errors
   $("#settings-reset").addEventListener("click", () => {
     for (const k in inputs) if (cfgDesc[k]) setInput(k, cfgDesc[k][0]);
-    showSheetMsg("Defaults filled in. Save to keep them.", true);
+    showSheetMsg("Defaults filled in (the camera is kept). Save to keep them.", true);
   });
   applyRanges();
 }
@@ -506,20 +872,30 @@ function showSheetMsg(text, ok) {
   sheetMsg.classList.toggle("ok", !!ok);
 }
 
-// Offline the sheet still opens (last values seen, or the defaults), but Save waits for the bridge.
+// Offline the sheet still opens (last values seen, or the defaults). Save keeps the camera at
+// once (this browser); the bridge's settings wait for the bridge.
 function sheetOnline() {
-  $("#settings-save").disabled = !cfgLive;
   if (!sheet.open || saving) return;
   showSheetMsg(!cfgLive
-    ? "Bridge offline: showing the last values it sent (defaults if never connected). Save works once it is online."
+    ? "Bridge offline: showing the last values it sent (defaults if never connected). The camera saves now, the rest once the bridge is online."
     : state.homing ? "Homing is running: settings can be saved after it." : "");
+}
+// Any bridge setting in the sheet differs from what the bridge has.
+function bridgeChanged() {
+  for (const k in inputs) if (Math.abs(readInput(k) - cfg[k]) > 1e-6) return true;
+  return false;
 }
 function openSheet() {
   for (const k in inputs) setInput(k, cfg[k]);
+  fillCamInputs();
   saving = false;
   if (typeof sheet.showModal === "function") sheet.showModal(); else sheet.setAttribute("open", "");
   sheetOnline();
 }
+$("#cam-setup").addEventListener("click", () => {
+  openSheet();
+  if (camGroupTitle) camGroupTitle.scrollIntoView({ block: "start" });
+});
 function closeSheet() {
   saving = false;
   if (sheet.open) sheet.close();
@@ -529,10 +905,18 @@ $("#settings-cancel").addEventListener("click", closeSheet);
 sheet.addEventListener("click", (e) => { if (e.target === sheet) closeSheet(); });  // backdrop
 $("#settings-form").addEventListener("submit", (e) => {
   e.preventDefault();
+  const c = readCamInputs();
+  if (c.why) { showSheetMsg(c.why); camInputs.url.focus(); return; }
+  saveCam(c.cam);
   const msg = { t: "settings_set" };
   for (const k in inputs) {
     clampInput(k);
     msg[k] = readInput(k);
+  }
+  if (!cfgLive) {
+    if (bridgeChanged()) showSheetMsg("Camera saved. The other settings need the bridge online: Save again then.");
+    else closeSheet();
+    return;
   }
   if (state.homing) { showSheetMsg("Homing is running: wait for it, then save."); return; }
   if (send(msg)) { saving = true; showSheetMsg("Saving..."); }
@@ -558,8 +942,241 @@ function onSettings(m) {
   updatePresets();
 }
 
+// ---------- Bed scan: tiles in a grid, then one collage (tools/scan_bed.py) ----------
+// Run by the camera server on the PC (tools/usb_cam.py), which moves the head through this
+// bridge's REST API with the token this page has. Buttons only for a camera server that
+// answers /scan/status. Pictures come straight from the PC, never through the bridge.
+let scanUrl = "";        // camera server origin that can scan ("" = no buttons)
+let scanTimer = 0;
+let scanLast = null;     // last /scan/status
+let scanGridFor = "";    // scan name the grid was built for
+const scanSheet = $("#scan"), collSheet = $("#collages");
+const scanBase = () => { try { return camOn() ? new URL(cam.url).origin : ""; } catch { return ""; } };
+const scanRunning = (st) => !!st && (st.state === "running" || st.state === "stopping");
+const scanPic = (name, file, w) =>
+  `${scanUrl}/scans/${encodeURIComponent(name)}/${file}${w ? "?w=" + w : ""}`;
+
+function scanShowButtons(url) {
+  scanUrl = url;
+  $("#cam-scan").hidden = $("#cam-collages").hidden = !url;
+}
+
+async function scanProbe() {
+  const base = scanBase();
+  let ok = false;
+  try {
+    const r = await fetch(base + "/scan/status", { cache: "no-store" });
+    const js = await r.json();
+    ok = r.ok && typeof js.state === "string";
+    if (ok && base === scanBase() && scanRunning(js)) scanLast = js;
+  } catch {}
+  if (base !== scanBase()) return;  // the camera was changed meanwhile
+  scanShowButtons(ok ? base : "");
+}
+
+function openDialog(d) {
+  if (typeof d.showModal === "function") d.showModal(); else d.setAttribute("open", "");
+}
+
+function scanSetMsg(text, err) {
+  const m = $("#scan-msg");
+  m.textContent = text || "";
+  m.classList.toggle("err", !!err);
+}
+
+// The start button: what it does now, and whether it can.
+function scanButton(st) {
+  const go = $("#scan-go");
+  const run = scanRunning(st);
+  go.textContent = run ? "Stop" : "Start";
+  const s = state;
+  const ready = homed(0) && homed(1) && s.link === "up" && !s.stopped && !s.halted && !s.homing;
+  go.disabled = run ? st.state === "stopping" : !ready;
+  return ready;
+}
+
+function scanRender(st) {
+  scanLast = st;
+  const ready = scanButton(st);
+  if (st.state === "idle" && !st.plan) {
+    scanSetMsg(ready
+      ? "Photographs the whole bed in overlapping tiles (X/Y moves at the current Z), then " +
+        "puts them together into one collage. Start begins at once."
+      : "Home X and Y first (Home button), then Start.", !ready);
+  } else {
+    scanSetMsg(st.msg, st.state === "error");
+  }
+  const grid = $("#scan-grid");
+  if (!st.plan || !st.name) {
+    if (!scanRunning(st)) { grid.textContent = ""; scanGridFor = ""; }
+  } else {
+    const rows = Math.max(...st.plan.map((p) => p.row)) + 1;
+    const cols = Math.max(...st.plan.map((p) => p.col)) + 1;
+    if (scanGridFor !== st.name) {  // one cell per tile, laid out like the bed: +Y up
+      grid.textContent = "";
+      grid.style.gridTemplateColumns = `repeat(${cols}, minmax(0, 1fr))`;
+      // the whole grid in view (about 60 % of the screen height), so it can be watched filling
+      grid.style.maxWidth = `calc(${(cols * (st.aspect || 4 / 3)) / rows} * 60vh)`;
+      st.plan.forEach((p, i) => {
+        const c = document.createElement("div");
+        c.className = "scan-cell";
+        c.dataset.file = p.file;
+        c.style.gridRow = String(rows - p.row);
+        c.style.gridColumn = String(p.col + 1);
+        c.style.aspectRatio = String(st.aspect || 4 / 3);
+        c.title = `row ${p.row}, column ${p.col}: X ${p.x.toFixed(1)}, Y ${p.y.toFixed(1)} mm`;
+        c.textContent = "#" + (i + 1);
+        const lbl = document.createElement("span");
+        lbl.className = "lbl";
+        lbl.textContent = `r${p.row} c${p.col}`;
+        c.appendChild(lbl);
+        grid.appendChild(c);
+      });
+      scanGridFor = st.name;
+    }
+    const last = st.done[st.done.length - 1];
+    for (const c of grid.children) {
+      const f = c.dataset.file;
+      if (st.done.includes(f) && !c.querySelector("img")) {
+        const img = document.createElement("img");
+        img.alt = "Tile " + f;
+        img.src = scanPic(st.name, f, 360);
+        c.prepend(img);
+      }
+      c.classList.toggle("moving", st.current === f);
+      c.classList.toggle("last", f === last && scanRunning(st));
+    }
+  }
+  const res = $("#scan-result");
+  const showColl = !!(st.collage && st.name && st.state === "done");
+  if (showColl && res.dataset.name !== st.name) {
+    $("#scan-collage").src = scanPic(st.name, "collage.jpg", 1400);
+    $("#scan-collage-link").href = scanPic(st.name, "collage.jpg");
+    res.dataset.name = st.name;
+  }
+  res.hidden = !showColl;
+  const log = $("#scan-log");
+  log.textContent = "";
+  for (const l of st.log || []) {
+    const li = document.createElement("li");
+    li.textContent = l;
+    log.appendChild(li);
+  }
+}
+
+async function scanPoll() {
+  clearTimeout(scanTimer);
+  if (!scanUrl || !scanSheet.open) return;
+  try {
+    const r = await fetch(scanUrl + "/scan/status", { cache: "no-store" });
+    scanRender(await r.json());
+  } catch {
+    scanSetMsg("The camera server (PC) is not reachable.", true);
+  }
+  if (scanSheet.open) scanTimer = setTimeout(scanPoll, scanRunning(scanLast) ? 700 : 2000);
+}
+
+async function scanPost(path, body) {
+  try {
+    const r = await fetch(scanUrl + path, {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body || {}),
+    });
+    const js = await r.json();
+    if (!r.ok) { scanSetMsg(js.error || "Refused", true); return; }
+    scanRender(js);
+  } catch {
+    scanSetMsg("The camera server (PC) is not reachable.", true);
+  }
+  scanPoll();
+}
+
+$("#scan-go").addEventListener("click", () => {
+  if (scanRunning(scanLast)) { scanPost("/scan/stop"); return; }
+  if (authRequired && !savedToken()) { login(false); if (!savedToken()) return; }
+  $("#scan-result").hidden = true;
+  $("#scan-grid").textContent = "";  // the last scan's tiles go at once
+  scanGridFor = "";
+  // the PC moves the head through this bridge (the page's own address) with this page's token
+  scanPost("/scan/start", { bridge: location.origin, token: savedToken() });
+});
+$("#cam-scan").addEventListener("click", () => {
+  openDialog(scanSheet);
+  if (scanLast) scanRender(scanLast);
+  else scanButton(null);
+  scanPoll();
+});
+$("#scan-close").addEventListener("click", () => scanSheet.close());
+scanSheet.addEventListener("close", () => clearTimeout(scanTimer));
+
+// The last scans: a collage thumbnail each, open it full size, or its tile grid.
+function scanDate(name) {
+  const m = /^(\d{4})-(\d\d)-(\d\d)_(\d\d)(\d\d)$/.exec(name);
+  return m ? `${m[3]}.${m[2]}.${m[1]} ${m[4]}:${m[5]}` : name;
+}
+
+async function collagesLoad() {
+  const list = $("#collage-list"), msg = $("#collages-msg");
+  msg.textContent = "Loading...";
+  msg.classList.remove("err");
+  try {
+    const r = await fetch(scanUrl + "/scans", { cache: "no-store" });
+    const scans = (await r.json()).scans || [];
+    list.textContent = "";
+    msg.textContent = scans.length ? "" : "No scans yet: use the Scan button.";
+    for (const s of scans) {
+      const item = document.createElement("div");
+      item.className = "collage-item";
+      const thumb = document.createElement(s.collage ? "a" : "div");
+      thumb.className = "thumb";
+      if (s.collage) {
+        thumb.href = scanPic(s.name, "collage.jpg");
+        thumb.target = "_blank";
+        thumb.rel = "noopener";
+        thumb.title = "Open the collage full size";
+        const img = document.createElement("img");
+        img.alt = "Collage " + scanDate(s.name);
+        img.loading = "lazy";
+        img.src = scanPic(s.name, "collage.jpg", 420);
+        thumb.appendChild(img);
+      } else {
+        const none = document.createElement("span");
+        none.className = "none";
+        none.textContent = "no collage";
+        thumb.appendChild(none);
+      }
+      const meta = document.createElement("div");
+      meta.className = "meta";
+      meta.textContent = scanDate(s.name);
+      const sub = document.createElement("div");
+      sub.className = "sub";
+      sub.textContent = `${s.tiles}/${s.plan || s.tiles} tiles` + (s.tiles < s.plan ? " (stopped)" : "");
+      const links = document.createElement("div");
+      links.className = "links";
+      const add = (text, file) => {
+        const a = document.createElement("a");
+        a.href = scanPic(s.name, file);
+        a.target = "_blank";
+        a.rel = "noopener";
+        a.textContent = text;
+        links.appendChild(a);
+      };
+      if (s.collage) add("Collage", "collage.jpg");
+      if (s.contact) add("Tile grid", "contact.jpg");
+      item.append(thumb, meta, sub, links);
+      list.appendChild(item);
+    }
+  } catch {
+    msg.textContent = "The camera server (PC) is not reachable.";
+    msg.classList.add("err");
+  }
+}
+$("#cam-collages").addEventListener("click", () => { openDialog(collSheet); collagesLoad(); });
+$("#collages-close").addEventListener("click", () => collSheet.close());
+$("#collages-reload").addEventListener("click", collagesLoad);
+
 buildSheet();
 sheetOnline();
 updateJog();
 updatePresets();
+camStart();
 connect();

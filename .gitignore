@@ -20,6 +20,8 @@ Thumbs.db
 # Python tools
 __pycache__/
 .venv/
+# bed scans from tools/scan_bed.py (photos, collages, calibration)
+scans/
 
 # per-machine VS Code settings (absolute paths)
 firmware/.vscode/
