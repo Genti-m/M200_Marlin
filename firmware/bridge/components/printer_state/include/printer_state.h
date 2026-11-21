@@ -43,6 +43,12 @@ typedef enum {
     PS_JOG_F_XY, PS_JOG_F_Z,       // mm/min: web jogs
     PS_PRESET_F,                   // mm/min: web preset moves
     PS_PRESET_EDGE,                // %: preset frames at edge / 50 / 100-edge
+    PS_LASER_FAN,                  // Marlin fan index the laser is on (M106 P)
+    PS_LASER_S_MAX,                // S for full power in M3/M4 and on moves (1000 GRBL, 255)
+    PS_LASER_CAP,                  // %: power cap, of full PWM
+    PS_LASER_TEST,                 // %: focus pulse power
+    PS_LASER_TEST_MS,              // ms: focus pulse length
+    PS_LASER_LEASE,                // s: armed only while a client says "alive" within this
     PS_COUNT
 } printer_setting_t;
 
@@ -79,6 +85,10 @@ typedef struct {
     float pos[3];    // X Y Z from the last M114
     float max_mm[3]; // the limits (settings PS_MAX_X/Y/Z)
     uint32_t queue;  // lines waiting in printer_link
+    bool laser_armed;  // printer_state_laser_arm(), until disarmed (by hand, lease, STOP, ...)
+    bool laser_on;     // M3/M4 given: G1/G2/G3 moves fire
+    int laser_pwm;     // 0..255: the laser fan's speed as last queued
+    bool laser_pin;    // an enable pin is configured (CONFIG_LASER_ENABLE_GPIO)
 } printer_state_t;
 
 typedef struct {
@@ -111,6 +121,8 @@ void printer_state_restart(void);
 //      M190, and M303: Marlin would kill() on MINTEMP / heating failed
 //    - every G28, G29, G30, M48: they preheat for the Z probe, Marlin would kill() on MINTEMP
 //    - G0-G3 taking a homed axis outside 0..max (settings) of its switch (arcs: end point)
+//    - laser: M3/M4 with power while not armed, M106 on the laser's fan, a bad S
+//      (gcode_laser_plan; M3/M4/M5 and "S.." are not sent, a laser line may go first)
 //  - or it is queued (waiting up to wait), and tracked (G90/G91, G92, moves). A STOP between
 //    the guard and the queue drops it (printer_link epochs). A full queue drops it too, and
 //    the homes with it (positions no longer known), with an "Error:bridge:" line.
@@ -130,6 +142,27 @@ void printer_state_note(const char *text);
 // "echo:bridge:" / "Error:bridge:" lines.
 esp_err_t printer_state_home_xy(void);
 esp_err_t printer_state_home_z(void);
+
+// Laser (road_Change.md ch. 8). The laser hangs on a Marlin fan output (setting laser_fan),
+// optionally behind an enable pin of the ESP (CONFIG_LASER_ENABLE_GPIO) that only the bridge
+// switches. Laser G-code (M3/M4 S, M5, G1 S) is refused or fires nothing until armed:
+//  - arm: needs the printer up, not stopped / homing, X and Y homed. Enable pin on.
+//  - armed only while a client calls printer_state_laser_alive() within the lease (setting
+//    laser_lease): the web page does while it is open and visible.
+//  - disarmed (enable pin off at once) by hand, lease ran out, STOP, homes lost (M84, queue
+//    full, M410), printer reset, kill, link lost. If the laser may still be firing or lines are
+//    queued, that is a soft STOP; else a laser-off line.
+//  - laser on but nothing new queued for 1 s: M400, then off (GRBL's "off when motion stops").
+// Settings can't change and homes can't start while armed.
+// arm / test: NULL when done, else why not (also shown as an "Error:bridge:" line).
+const char *printer_state_laser_arm(void);
+void printer_state_laser_alive(void);
+void printer_state_laser_disarm(void);
+// Focus pulse: laser_test % for laser_test_ms, head standing still (armed, nothing queued).
+const char *printer_state_laser_test(void);
+
+// Most printer-queue places a line can take (a laser line may go before it): batch check.
+int printer_state_line_cost(const char *line);
 
 // Copy the history, oldest first. Return the number of entries written (<= max).
 size_t printer_state_copy_lines(printer_hist_line_t *out, size_t max);

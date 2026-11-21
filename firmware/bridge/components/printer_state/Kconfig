@@ -1,0 +1,24 @@
+menu "Laser (road_Change.md ch. 8)"
+
+    config LASER_ENABLE_GPIO
+        int "Laser enable GPIO, -1 = none"
+        range -1 48
+        default -1
+        help
+            An ESP32-S3 output that only the bridge switches: on while the laser is armed,
+            off at once on disarm, STOP, lease timeout, kill or a lost printer link, without
+            waiting for Marlin's queue. Wire it to a driver input or a MOSFET in the laser's
+            supply, in series with the Marlin fan output, with a pull-down (or pull-up for
+            active low) so the laser stays off while the ESP boots or is unplugged.
+            -1: no pin, the laser is switched by the fan output only.
+            Refused at start (arming then refused, error in the log): 17 / 18 (printer UART),
+            19 / 20 (USB console), 26..37 (flash, octal PSRAM), 0 / 3 / 45 / 46 (strapping:
+            the pull-down would change the boot mode). Until printer_state starts (about the
+            first second after a reset) only the external pull resistor holds it off.
+
+    config LASER_ENABLE_ACTIVE_LOW
+        bool "Enable pin is active low"
+        default n
+        depends on LASER_ENABLE_GPIO >= 0
+
+endmenu

@@ -1,6 +1,7 @@
 #include "gcode_guard.h"
 
 #include <ctype.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -164,4 +165,115 @@ void gcode_track(gcode_motion_t *m, const char *line, float z_dir)
             a->l = m->relative ? a->l + v : v;
         }
     }
+}
+
+// ---------------------------------------------------------------- laser
+
+int gcode_laser_pwm(const gcode_laser_cfg_t *c, float s)
+{
+    if (!(s > 0) || !(c->s_max > 0) || !(c->cap > 0)) {
+        return 0;
+    }
+    float share = s >= c->s_max ? 1.0f : s / c->s_max;  // GRBL clamps S above its max
+    float cap = c->cap > 1 ? 1.0f : c->cap;
+    long v = lroundf(share * cap * 255.0f);
+    return v < 0 ? 0 : v > 255 ? 255 : (int)v;
+}
+
+static const char *const LASER_BAD_S = "Error:bridge: laser: S must be a number, 0 or more";
+
+// An S word, if there is one: false + *bad when it is negative or NaN.
+static bool laser_s(const char *rest, float *s, bool *bad)
+{
+    float v;
+    if (!gcode_num_param(rest, 'S', &v)) {
+        return false;
+    }
+    if (!(v >= 0)) {
+        *bad = true;
+        return false;
+    }
+    *s = v;
+    return true;
+}
+
+const char *gcode_laser_plan(const gcode_laser_t *l, const gcode_laser_cfg_t *c, bool armed,
+                             const char *line, gcode_laser_step_t *out)
+{
+    const char *rest = NULL;
+    int g = gcode_command_code(line, 'G', &rest);
+    int mc = g < 0 ? gcode_command_code(line, 'M', &rest) : -1;
+    bool bad = false;
+    float v;
+
+    out->pre_pwm = -1;
+    out->send = true;
+    out->next = *l;
+    gcode_laser_t *n = &out->next;
+
+    if (mc == 3 || mc == 4) {
+        laser_s(rest, &n->s, &bad);
+        if (bad) {
+            return LASER_BAD_S;
+        }
+        if (!armed && gcode_laser_pwm(c, n->s) > 0) {
+            return "Error:bridge: laser not armed: arm it on the page first";
+        }
+        n->on = true;
+        out->send = false;  // fires with the next G1/G2/G3
+        return NULL;
+    }
+    if (mc == 5) {
+        n->on = false;
+        out->send = false;
+        if (l->pwm != 0) {
+            out->pre_pwm = n->pwm = 0;
+        }
+        return NULL;
+    }
+    if (mc == 106 || mc == 107) {
+        float p = 0;
+        gcode_num_param(rest, 'P', &p);  // no P: fan 0, as in Marlin
+        if (!(p == (float)c->fan)) {
+            return NULL;  // another fan
+        }
+        if (mc == 106 && !(gcode_num_param(rest, 'S', &v) && v <= 0)) {
+            return "Error:bridge: that fan output is the laser: use M3 S<power> / M5, not M106";
+        }
+        n->on = false;
+        n->pwm = 0;
+        return NULL;
+    }
+    if (g < 0 && mc < 0) {
+        // A lone "S500" (GRBL: S is modal) sets the power for the next moves.
+        const char *p = line;
+        while (*p == ' ') {
+            p++;
+        }
+        if (toupper((unsigned char)*p) == 'S' && laser_s(p, &n->s, &bad)) {
+            out->send = false;
+        }
+        return bad ? LASER_BAD_S : NULL;
+    }
+
+    int target = -1;
+    if (g >= 0 && g <= 3) {
+        laser_s(rest, &n->s, &bad);  // on G0 too: S is modal
+        if (bad) {
+            return LASER_BAD_S;
+        }
+        target = g == 0 || !armed || !n->on ? 0 : gcode_laser_pwm(c, n->s);
+    } else if (g == 4) {
+        target = 0;  // standing still (G4 S is seconds there, not power)
+    }
+    if (target >= 0 && target != l->pwm) {
+        out->pre_pwm = n->pwm = target;
+    }
+    return NULL;
+}
+
+int gcode_laser_cost(const char *line)
+{
+    int g = gcode_command_code(line, 'G', NULL);
+    return (g >= 0 && g <= 4) || gcode_command_code(line, 'M', NULL) == 5 ? 2 : 1;
 }

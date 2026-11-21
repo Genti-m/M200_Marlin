@@ -207,8 +207,116 @@ static void test_partial_home(void)
     CHECK(refuse(&m, "G1 X999 Z999") != NULL);
 }
 
+// ---------------------------------------------------------------- laser
+
+static const gcode_laser_cfg_t LCFG = {.fan = 0, .s_max = 1000, .cap = 1};
+
+// Run one line through the planner and keep the new state (as printer_state does once queued).
+static const char *lz(gcode_laser_t *l, const gcode_laser_cfg_t *c, bool armed, const char *line,
+                      gcode_laser_step_t *st)
+{
+    const char *why = gcode_laser_plan(l, c, armed, line, st);
+    if (!why) {
+        *l = st->next;
+    }
+    return why;
+}
+
+static void test_laser_pwm(void)
+{
+    CHECK(gcode_laser_pwm(&LCFG, 0) == 0);
+    CHECK(gcode_laser_pwm(&LCFG, 1000) == 255);
+    CHECK(gcode_laser_pwm(&LCFG, 5000) == 255);  // clamped like GRBL
+    CHECK(gcode_laser_pwm(&LCFG, 500) == 128);
+    CHECK(gcode_laser_pwm(&LCFG, -1) == 0);
+    CHECK(gcode_laser_pwm(&LCFG, NAN) == 0);
+    gcode_laser_cfg_t c = {.fan = 1, .s_max = 255, .cap = 0.5f};
+    CHECK(gcode_laser_pwm(&c, 255) == 128);  // cap 50 %
+    CHECK(gcode_laser_pwm(&c, 51) == 26);
+}
+
+static void test_laser_grbl_mode(void)
+{
+    gcode_laser_t l = {0};
+    gcode_laser_step_t st;
+
+    // M3 only sets the power: nothing is sent, the laser fires with the next G1
+    CHECK(lz(&l, &LCFG, true, "M3 S500", &st) == NULL && !st.send && st.pre_pwm == -1 && l.on);
+    CHECK(lz(&l, &LCFG, true, "G0 X10 Y10", &st) == NULL && st.send && st.pre_pwm == -1);
+    CHECK(lz(&l, &LCFG, true, "G1 X20 F600", &st) == NULL && st.send && st.pre_pwm == 128);
+    CHECK(lz(&l, &LCFG, true, "G1 X30", &st) == NULL && st.pre_pwm == -1);  // same power: no line
+    // inline S changes it, the new S stays (modal)
+    CHECK(lz(&l, &LCFG, true, "G1 X40 S1000", &st) == NULL && st.pre_pwm == 255 && NEAR(l.s, 1000));
+    CHECK(lz(&l, &LCFG, true, "G1X50S250", &st) == NULL && st.pre_pwm == 64);
+    // G0 travel and G4 dwell: off; the next G1 fires again
+    CHECK(lz(&l, &LCFG, true, "G0 X0", &st) == NULL && st.pre_pwm == 0 && l.pwm == 0);
+    CHECK(lz(&l, &LCFG, true, "G1 X5", &st) == NULL && st.pre_pwm == 64);
+    CHECK(lz(&l, &LCFG, true, "G4 P200", &st) == NULL && st.pre_pwm == 0);
+    CHECK(lz(&l, &LCFG, true, "G4 S1", &st) == NULL && st.pre_pwm == -1 && NEAR(l.s, 250));  // S = seconds
+    // a lone S word: new power, not sent
+    CHECK(lz(&l, &LCFG, true, "S750", &st) == NULL && !st.send && NEAR(l.s, 750));
+    CHECK(lz(&l, &LCFG, true, "G2 X10 Y10 I5 J0", &st) == NULL && st.pre_pwm == 191);
+    // M5: off, nothing sent but the off line
+    CHECK(lz(&l, &LCFG, true, "M5", &st) == NULL && !st.send && st.pre_pwm == 0 && !l.on);
+    CHECK(lz(&l, &LCFG, true, "G1 X0", &st) == NULL && st.pre_pwm == -1);  // off: G1 doesn't fire
+    CHECK(lz(&l, &LCFG, true, "M5", &st) == NULL && st.pre_pwm == -1);     // already off
+    // M4 = M3; M3 without S keeps the last S
+    CHECK(lz(&l, &LCFG, true, "M4", &st) == NULL && l.on);
+    CHECK(lz(&l, &LCFG, true, "N7 G1 X1", &st) == NULL && st.pre_pwm == 191);
+    // other lines don't touch the laser
+    CHECK(lz(&l, &LCFG, true, "M114", &st) == NULL && st.send && st.pre_pwm == -1 && l.pwm == 191);
+}
+
+static void test_laser_refusals(void)
+{
+    gcode_laser_t l = {0};
+    gcode_laser_step_t st;
+    // not armed: M3 with power refused, M3 S0 / M5 fine, G1 S never fires
+    CHECK(lz(&l, &LCFG, false, "M3 S100", &st) != NULL);
+    CHECK(lz(&l, &LCFG, false, "M3", &st) == NULL);  // S still 0
+    CHECK(lz(&l, &LCFG, false, "G1 X10 S900", &st) == NULL && st.pre_pwm == -1 && l.pwm == 0);
+    CHECK(lz(&l, &LCFG, false, "M3", &st) != NULL);  // S is 900 now
+    CHECK(lz(&l, &LCFG, false, "M5", &st) == NULL);
+    // disarmed while on: G1 sends off
+    l = (gcode_laser_t){.on = true, .s = 500, .pwm = 128};
+    CHECK(lz(&l, &LCFG, false, "G1 X10", &st) == NULL && st.pre_pwm == 0);
+    // bad S
+    CHECK(gcode_laser_plan(&l, &LCFG, true, "M3 S-5", &st) != NULL);
+    CHECK(gcode_laser_plan(&l, &LCFG, true, "G1 X1 Snan", &st) != NULL);
+    CHECK(gcode_laser_plan(&l, &LCFG, true, "S-1", &st) != NULL);
+    // M106 on the laser's fan (no P = fan 0): only off passes
+    l = (gcode_laser_t){.on = true, .s = 500, .pwm = 128};
+    CHECK(gcode_laser_plan(&l, &LCFG, true, "M106 S255", &st) != NULL);
+    CHECK(gcode_laser_plan(&l, &LCFG, true, "M106", &st) != NULL);  // no S = full speed
+    CHECK(gcode_laser_plan(&l, &LCFG, true, "M106 P0 S1", &st) != NULL);
+    CHECK(lz(&l, &LCFG, true, "M106 S0", &st) == NULL && st.send && l.pwm == 0 && !l.on);
+    l.pwm = 50;
+    CHECK(lz(&l, &LCFG, true, "M107", &st) == NULL && st.send && l.pwm == 0);
+    // another fan passes, also full speed
+    CHECK(gcode_laser_plan(&l, &LCFG, true, "M106 P1", &st) == NULL && st.send);
+    gcode_laser_cfg_t c1 = LCFG;
+    c1.fan = 1;
+    CHECK(gcode_laser_plan(&l, &c1, true, "M106 S255", &st) == NULL);       // fan 0: not the laser
+    CHECK(gcode_laser_plan(&l, &c1, true, "M106 P1 S255", &st) != NULL);
+}
+
+static void test_laser_cost(void)
+{
+    CHECK(gcode_laser_cost("G1 X10") == 2);
+    CHECK(gcode_laser_cost("G0X1") == 2);
+    CHECK(gcode_laser_cost("G4 P100") == 2);
+    CHECK(gcode_laser_cost("M5") == 2);
+    CHECK(gcode_laser_cost("M114") == 1);
+    CHECK(gcode_laser_cost("G90") == 1);
+    CHECK(gcode_laser_cost("M3 S100") == 1);
+}
+
 int main(void)
 {
+    test_laser_pwm();
+    test_laser_grbl_mode();
+    test_laser_refusals();
+    test_laser_cost();
     test_command_code();
     test_num_param();
     test_emergency_code();

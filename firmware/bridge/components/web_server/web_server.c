@@ -110,7 +110,10 @@ static void jb_state(jbuf_t *b, bool with_type)
     } else {
         jb_puts(b, ",\"rssi\":null");
     }
-    jb_printf(b, ",\"queue\":%u}", (unsigned)s.queue);
+    jb_printf(b, ",\"queue\":%u", (unsigned)s.queue);
+    jb_printf(b, ",\"laser\":{\"armed\":%s,\"on\":%s,\"pwm\":%d,\"pin\":%s}}",
+              s.laser_armed ? "true" : "false", s.laser_on ? "true" : "false", s.laser_pwm,
+              s.laser_pin ? "true" : "false");
 }
 
 // {"t":"settings","v":{"max_x":170,...},"d":{"max_x":[default,min,max,step],...}}
@@ -408,6 +411,10 @@ static void handle_client_json(httpd_req_t *req, const char *js)
         printer_state_soft_stop(PRINTER_SRC_WEB);
         return;
     }
+    if (strcmp(type, "laser_disarm") == 0) {  // like stop: making it safer needs no login
+        printer_state_laser_disarm();
+        return;
+    }
     if (strcmp(type, "auth") == 0) {
         ws_login(req, js);
         return;
@@ -425,6 +432,12 @@ static void handle_client_json(httpd_req_t *req, const char *js)
     } else if (strcmp(type, "settings_set") == 0) {
         char why[PRINTER_STATE_WHY_MAX];
         apply_settings(js, why);  // the answer is a "settings" message, or an Error:bridge: line
+    } else if (strcmp(type, "laser_arm") == 0) {
+        printer_state_laser_arm();  // the answer is the state, or an Error:bridge: line
+    } else if (strcmp(type, "laser_alive") == 0) {
+        printer_state_laser_alive();
+    } else if (strcmp(type, "laser_test") == 0) {
+        printer_state_laser_test();
     } else if (strcmp(type, "gcode") == 0) {
         const char *start = jin_find(js, "lines");
         if (!start || *start != '[') {
@@ -442,7 +455,7 @@ static void handle_client_json(httpd_req_t *req, const char *js)
                     return;
                 }
                 if (pass == 0) {
-                    count++;
+                    count += printer_state_line_cost(line);  // a laser line may go first
                 } else if (submit_line(line) < 0) {
                     return;
                 }
@@ -626,12 +639,17 @@ static esp_err_t api_gcode_post(httpd_req_t *req)
     if (!body) {
         return ESP_FAIL;
     }
-    int lines = 0;  // non-blank lines, for the whole-batch check
+    int lines = 0;  // queue places the non-blank lines can take, for the whole-batch check
     for (const char *p = body; *p;) {
         const char *nl = strchr(p, '\n');
         size_t n = nl ? (size_t)(nl - p) : strlen(p);
-        if (strspn(p, " \t\r") < n) {
-            lines++;
+        size_t sp = strspn(p, " \t\r");
+        if (sp < n) {
+            char one[USER_LINE_MAX + 1];
+            size_t k = n - sp < USER_LINE_MAX ? n - sp : USER_LINE_MAX;
+            memcpy(one, p + sp, k);
+            one[k] = '\0';
+            lines += printer_state_line_cost(one);
         }
         p += n + (nl ? 1 : 0);
     }
@@ -699,6 +717,50 @@ static esp_err_t api_stop_post(httpd_req_t *req)
     }
     printer_state_soft_stop(PRINTER_SRC_WEB);
     return send_json(req, "{\"ok\":true}");
+}
+
+// POST /api/laser {"arm":true} | {"arm":false} | {"alive":true} | {"test":true}. Disarm needs
+// no token (like STOP); a REST client that arms must post "alive" within the lease.
+static esp_err_t api_laser_post(httpd_req_t *req)
+{
+    char *body = read_body(req, 256);
+    if (!body) {
+        return ESP_FAIL;
+    }
+    const char *arm = jin_find(body, "arm");
+    bool disarm = arm && strncmp(arm, "false", 5) == 0;
+    if (disarm ? !origin_ok(req) : !rest_authed(req, false)) {
+        free(body);
+        if (disarm) {
+            httpd_resp_send_err(req, HTTPD_403_FORBIDDEN, "foreign Origin");
+        }
+        return ESP_OK;
+    }
+    const char *why = NULL;
+    const char *v;
+    if (disarm) {
+        printer_state_laser_disarm();
+    } else if (arm && strncmp(arm, "true", 4) == 0) {
+        why = printer_state_laser_arm();
+    } else if ((v = jin_find(body, "alive")) && strncmp(v, "true", 4) == 0) {
+        printer_state_laser_alive();
+    } else if ((v = jin_find(body, "test")) && strncmp(v, "true", 4) == 0) {
+        why = printer_state_laser_test();
+    } else {
+        why = "Error:bridge: laser: send arm, alive or test";
+    }
+    free(body);
+    if (!why) {
+        return send_json(req, "{\"ok\":true}");
+    }
+    jbuf_t b;
+    jb_init(&b, 160);
+    jb_puts(&b, "{\"ok\":false,\"error\":");
+    jb_str(&b, why);
+    jb_puts(&b, "}");
+    esp_err_t err = b.oom ? httpd_resp_send_500(req) : send_json(req, b.buf);
+    jb_free(&b);
+    return err;
 }
 
 static esp_err_t api_restart_post(httpd_req_t *req)
@@ -855,6 +917,7 @@ esp_err_t web_server_start(void)
         {.uri = "/api/settings", .method = HTTP_POST, .handler = api_settings_post},
         {.uri = "/api/stop", .method = HTTP_POST, .handler = api_stop_post},
         {.uri = "/api/restart", .method = HTTP_POST, .handler = api_restart_post},
+        {.uri = "/api/laser", .method = HTTP_POST, .handler = api_laser_post},
         {.uri = "/api/ota", .method = HTTP_POST, .handler = api_ota_post},
     };
     for (size_t i = 0; i < sizeof(uris) / sizeof(uris[0]); i++) {

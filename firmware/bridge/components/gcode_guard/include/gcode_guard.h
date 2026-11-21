@@ -64,6 +64,50 @@ const char *gcode_refusal(const gcode_motion_t *m, const float max_mm[3], const 
 // A G92 naming an axis in home_mask marks it homed with dir +1 (X, Y) / -z_dir (Z).
 void gcode_track(gcode_motion_t *m, const char *line, float z_dir);
 
+// ---------------------------------------------------------------- laser (road_Change.md ch. 8)
+// Stock Marlin has no laser feature, so the laser hangs on a fan output and the bridge turns
+// GRBL-style laser G-code (what LaserGRBL / LightBurn write) into M106 on that fan, like GRBL's
+// laser mode: M3/M4 S<power> only sets the power, the laser fires during G1/G2/G3 moves and is
+// off during G0 travel and G4 dwells. M106 sits between the moves in Marlin's queue: Marlin
+// stores the fan speed in the planner blocks after it, but writes it to the output in a 10 Hz
+// poll (check_axes_activity), so a change lands up to ~100 ms after its block starts.
+
+typedef struct {
+    int fan;      // Marlin fan index the laser is on (M106 P<fan>)
+    float s_max;  // the S that means full power in M3/M4 and on moves (1000 like GRBL, or 255)
+    float cap;    // 0..1: the highest share of full PWM ever sent
+} gcode_laser_cfg_t;
+
+typedef struct {
+    bool on;      // M3/M4 given, until M5 / M107 / disarm
+    float s;      // last S (modal, as in GRBL)
+    int pwm;      // 0..255: what the bridge last queued for the laser fan
+} gcode_laser_t;
+
+typedef struct {
+    int pre_pwm;         // -1: nothing, else queue "M106 P<fan> S<pre_pwm>" before the line
+    bool send;           // the line itself goes to Marlin (M3/M4/M5 and a lone "S500" don't)
+    gcode_laser_t next;  // the laser after this line, once both are queued
+} gcode_laser_step_t;
+
+// PWM (0..255) for power s, capped.
+int gcode_laser_pwm(const gcode_laser_cfg_t *c, float s);
+
+// What a line does to the laser, or why it is refused (a string constant):
+//  - M3/M4 [S]: power on for the next moves. Refused unless armed when the power is above 0.
+//    M4 is the same as M3 (stock Marlin can't scale the power with the speed).
+//  - M5: off. Always allowed.
+//  - M106 on the laser's fan with S above 0 (or no S: full speed in Marlin): refused, use M3.
+//    M106 S0 / M107 on it: off. Other fans pass untouched.
+//  - G1/G2/G3 [S]: the laser at the power (0 when not on or not armed). G0 [S] and G4: off.
+//  - a lone "S500": new power, not sent. A negative or NaN S is refused.
+const char *gcode_laser_plan(const gcode_laser_t *l, const gcode_laser_cfg_t *c, bool armed,
+                             const char *line, gcode_laser_step_t *out);
+
+// Most lines one line can take in the printer queue (2 when a laser line may go before it), for
+// a batch that must go in whole.
+int gcode_laser_cost(const char *line);
+
 #ifdef __cplusplus
 }
 #endif

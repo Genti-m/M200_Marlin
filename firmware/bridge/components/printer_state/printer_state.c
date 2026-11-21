@@ -6,10 +6,12 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "driver/gpio.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
+#include "freertos/task.h"
 #include "gcode_guard.h"
 #include "nvs.h"
 
@@ -49,6 +51,80 @@ static const printer_setting_desc_t SETTINGS[PS_COUNT] = {
     [PS_JOG_F_Z]     = {"jog_f_z", 600, 30, 1500, 10},
     [PS_PRESET_F]    = {"preset_f", 3000, 100, 6000, 100},
     [PS_PRESET_EDGE] = {"preset_edge", 10, 0, 40, 1},
+    // Laser: the module isn't chosen yet (road_Change.md ch. 8), so the cap starts at 100 %
+    // and the hardware decides; the focus pulse starts low.
+    [PS_LASER_FAN]     = {"laser_fan", 0, 0, 7, 1},
+    [PS_LASER_S_MAX]   = {"laser_s_max", 1000, 1, 10000, 1},
+    [PS_LASER_CAP]     = {"laser_cap", 100, 1, 100, 1},
+    [PS_LASER_TEST]    = {"laser_test", 2, 0.5f, 20, 0.5f},
+    [PS_LASER_TEST_MS] = {"laser_test_ms", 300, 50, 2000, 50},
+    [PS_LASER_LEASE]   = {"laser_lease", 3, 2, 30, 1},  // the page says "alive" every 0.7 s
+};
+
+// ---------------------------------------------------------------- laser hardware
+// The optional enable pin (Kconfig LASER_ENABLE_GPIO): off at boot, on only while armed.
+static bool s_pin_ok;   // configured and usable
+static bool s_pin_bad;  // configured but not usable: arming refused
+
+#if CONFIG_LASER_ENABLE_GPIO >= 0
+#define LASER_PIN CONFIG_LASER_ENABLE_GPIO
+#ifdef CONFIG_LASER_ENABLE_ACTIVE_LOW
+#define LASER_PIN_ON 0
+#else
+#define LASER_PIN_ON 1
+#endif
+
+static void laser_pin(bool on)
+{
+    if (s_pin_ok) {
+        gpio_set_level(LASER_PIN, on ? LASER_PIN_ON : !LASER_PIN_ON);
+    }
+}
+
+// ESP32-S3 pins that must not carry the laser enable: the printer UART, USB D-/D+ (the USB
+// console, 19/20), SPI flash and the octal PSRAM of the S3R8 (26..37), and the strapping pins
+// (0, 3, 45, 46), whose level at reset (the laser pull-down) picks the boot mode.
+static bool laser_pin_usable(int pin)
+{
+    return GPIO_IS_VALID_OUTPUT_GPIO(pin) && pin != CONFIG_PRINTER_LINK_TX_GPIO &&
+           pin != CONFIG_PRINTER_LINK_RX_GPIO && pin != 19 && pin != 20 &&
+           !(pin >= 26 && pin <= 37) && pin != 0 && pin != 3 && pin != 45 && pin != 46;
+}
+
+static void laser_pin_init(void)
+{
+    if (!laser_pin_usable(LASER_PIN)) {
+        ESP_LOGE(TAG, "laser enable GPIO %d is not a free output (UART, USB, flash/PSRAM or "
+                 "strapping pin): arming refused", LASER_PIN);
+        s_pin_bad = true;
+        return;
+    }
+    // Off level first, then the output, with the internal pull toward off. Not gpio_reset_pin():
+    // it turns the pull-up on, a moment toward "on" for an active-high driver.
+    gpio_set_level(LASER_PIN, !LASER_PIN_ON);
+    const gpio_config_t io = {
+        .pin_bit_mask = 1ULL << LASER_PIN,
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = LASER_PIN_ON ? GPIO_PULLUP_DISABLE : GPIO_PULLUP_ENABLE,
+        .pull_down_en = LASER_PIN_ON ? GPIO_PULLDOWN_ENABLE : GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    s_pin_ok = gpio_config(&io) == ESP_OK && gpio_set_level(LASER_PIN, !LASER_PIN_ON) == ESP_OK;
+    s_pin_bad = !s_pin_ok;
+}
+#else  // no enable pin: the fan output alone switches the laser
+static void laser_pin(bool on) { (void)on; }
+static void laser_pin_init(void) {}
+#endif
+
+// Laser on but nothing new queued for this long: M400, then off (motion has stopped).
+#define LASER_IDLE_OFF_US (1000 * 1000)
+
+// What a disarm still has to do, done by the laser task (it may block on the queue).
+enum {
+    LASER_DROP_NONE,  // nothing to send: Marlin restarted or can't read (kill)
+    LASER_DROP_OFF,   // a laser-off line
+    LASER_DROP_STOP,  // soft STOP if the laser may be firing or lines are queued, else laser off
 };
 
 static struct {
@@ -64,9 +140,20 @@ static struct {
     int64_t last_busy_us;
     bool stopped;  // soft STOP pressed, until printer_state_restart()
     bool halted;   // Marlin called kill(): no input until the printer is reset ("start")
+    gcode_laser_t laser;      // M3 on, S, the laser fan's PWM as queued (gcode_guard)
+    bool armed;
+    int64_t lease_until_us;   // armed until then, unless a client says "alive"
+    int64_t last_submit_us;   // last accepted user line: the idle-off watch
+    bool drop_pending;        // a disarm for the laser task to finish
+    int drop_mode;            // LASER_DROP_*: the strongest since the last one was finished
+    const char *drop_why;     // its note (a constant), or NULL
 } s;
 
 static SemaphoreHandle_t s_sw_sem;  // given on every M119 "z_probe:" line (its last one)
+// Held from the guard to the queue by every user line and laser line: a laser line and the
+// move it belongs to go in one after the other, no other client's line between them.
+static SemaphoreHandle_t s_submit;
+static TaskHandle_t s_laser_task;
 
 static printer_hist_line_t s_lines[PRINTER_STATE_LINES];
 static size_t s_lines_next, s_lines_count;
@@ -115,8 +202,40 @@ static void push_temp_sample(int64_t now)
     }
 }
 
+// Disarm: the enable pin goes off here and now, the rest (note, laser-off line or STOP) is
+// left to the laser task. why: a note (a constant, no "kill" / "halted"), or NULL.
+static void laser_drop_locked(const char *why, int mode)
+{
+    if (!s.armed) {
+        return;
+    }
+    s.armed = false;
+    laser_pin(false);
+    s.laser.on = false;
+    if (!s.drop_pending || mode > s.drop_mode) {
+        s.drop_mode = mode;
+    }
+    if (why) {
+        s.drop_why = why;
+    }
+    s.drop_pending = true;
+    if (s_laser_task) {
+        xTaskNotifyGive(s_laser_task);
+    }
+}
+
+// Marlin restarted or stopped reading: its fans are off (restart), or nothing can be sent.
+static void laser_reset_locked(const char *why)
+{
+    laser_drop_locked(why, LASER_DROP_NONE);
+    s.laser.on = false;
+    s.laser.pwm = 0;
+}
+
 static void unhome(void)
 {
+    // The laser needs the homes (its limits): losing them disarms it.
+    laser_drop_locked("Error:bridge: laser disarmed: homes lost", LASER_DROP_STOP);
     gcode_unhome(&s.mo);
     s.pos_valid = false;
 }
@@ -134,6 +253,11 @@ static bool unplugged(const marlin_temp_t *t)
 // kill() turns every heater off; Marlin can't report that any more, so show it ourselves.
 static void halt(void)
 {
+    // Marlin reads nothing more, and its kill() / minkill() don't zero the fans (bugfix-2.1.x
+    // source); minkill() also turns interrupts off, so a software-PWM fan output freezes as it
+    // is. Only the enable pin (off now) or the hardware E-stop cut the laser.
+    laser_drop_locked("Error:bridge: laser disarmed: Marlin stopped, its fan output stays as it "
+                      "was: cut the laser power", LASER_DROP_NONE);
     unhome();
     s.home_abort = true;
     s.halted = true;
@@ -156,6 +280,8 @@ static bool on_tx(const printer_tx_event_t *ev)
     }
     if (ev->emergency) {
         s.home_abort = true;  // its queued lines are dropped
+        // M410 / M108 cleared the queue: only the laser-off line is left to send.
+        laser_drop_locked("Error:bridge: laser disarmed: emergency command", LASER_DROP_OFF);
     }
     if (m == 84 || m == 18 || m == 112 || ev->emergency) {
         bool changed = s.pos_valid || any_homed();
@@ -205,6 +331,7 @@ static bool on_rx(const printer_rx_event_t *ev, int64_t now, bool *send_autorepo
         s.last_busy_us = now;
         break;
     case MARLIN_LINE_START:
+        laser_reset_locked("Error:bridge: laser disarmed: printer restarted");
         unhome();
         s.home_abort = true;  // a home's moves must not go on into a fresh Marlin
         s.mo.relative = false;  // Marlin boots in G90
@@ -254,6 +381,10 @@ static void on_printer_event(void *arg, esp_event_base_t base, int32_t id, void 
         push_line(true, ev->source, ev->text);
         changed = on_tx(ev);
     } else if (id == PRINTER_EVENT_LINK_STATE) {
+        if (*(const printer_link_state_t *)data != PRINTER_LINK_UP) {
+            laser_drop_locked("Error:bridge: laser disarmed: the printer stopped answering",
+                              LASER_DROP_STOP);
+        }
         changed = true;
     }
     xSemaphoreGive(s_mux);
@@ -341,6 +472,12 @@ static bool settings_check(const float *v, char why[PRINTER_STATE_WHY_MAX])
                  v[PS_Z_SLOW_STEP] > v[PS_Z_FAST_STEP])) {
         msg = "Error:bridge: the slow pass can't be faster or coarser than the seek";
     }
+    if (!msg && v[PS_LASER_FAN] != floorf(v[PS_LASER_FAN])) {
+        msg = "Error:bridge: setting laser_fan must be a whole number";
+    }
+    if (!msg && v[PS_LASER_TEST] > v[PS_LASER_CAP]) {
+        msg = "Error:bridge: setting laser_test can't be above laser_cap";
+    }
     if (msg) {
         strlcpy(why, msg, PRINTER_STATE_WHY_MAX);
     }
@@ -362,6 +499,11 @@ bool printer_state_set_settings(const float in[PS_COUNT], char why[PRINTER_STATE
     xSemaphoreTake(s_mux, portMAX_DELAY);
     if (ok && s.homing) {
         strlcpy(why, "Error:bridge: settings can't change while homing", PRINTER_STATE_WHY_MAX);
+        ok = false;
+    }
+    if (ok && s.armed) {
+        strlcpy(why, "Error:bridge: settings can't change while the laser is armed",
+                PRINTER_STATE_WHY_MAX);
         ok = false;
     }
     bool same = ok && memcmp(in, s.cfg, sizeof(s.cfg)) == 0;
@@ -390,14 +532,19 @@ bool printer_state_set_settings(const float in[PS_COUNT], char why[PRINTER_STATE
 
 // ---------------------------------------------------------------- API
 
+static void laser_task(void *arg);
+static void laser_off_line(char *buf, size_t len);
+
 esp_err_t printer_state_start(void)
 {
     if (s_mux) {
         return ESP_ERR_INVALID_STATE;
     }
+    laser_pin_init();  // first: the enable pin is off from here on
     s_mux = xSemaphoreCreateMutex();
     s_sw_sem = xSemaphoreCreateBinary();
-    if (!s_mux || !s_sw_sem) {
+    s_submit = xSemaphoreCreateMutex();
+    if (!s_mux || !s_sw_sem || !s_submit) {
         return ESP_ERR_NO_MEM;
     }
     settings_load(s.cfg);
@@ -412,7 +559,14 @@ esp_err_t printer_state_start(void)
     if (err != ESP_OK) {
         return err;
     }
-    // The printer may already be running (bridge reset): its "start" won't come again.
+    if (xTaskCreate(laser_task, "laser", 3072, NULL, 5, &s_laser_task) != pdPASS) {
+        return ESP_ERR_NO_MEM;
+    }
+    // The printer may already be running (bridge reset): its "start" won't come again, and
+    // the laser fan may still be on from before the reset.
+    char off[24];
+    laser_off_line(off, sizeof(off));
+    printer_send(off, PRINTER_SRC_INTERNAL, pdMS_TO_TICKS(100));
     return printer_send(AUTOREPORT_CMD, PRINTER_SRC_INTERNAL, pdMS_TO_TICKS(100));
 }
 
@@ -439,6 +593,10 @@ void printer_state_get(printer_state_t *out)
     out->bed_unplugged = unplugged(&s.bed);
     out->pos_valid = s.pos_valid;
     memcpy(out->pos, s.pos, sizeof(out->pos));
+    out->laser_armed = s.armed;
+    out->laser_on = s.laser.on;
+    out->laser_pwm = s.laser.pwm;
+    out->laser_pin = s_pin_ok;
     xSemaphoreGive(s_mux);
     out->queue = printer_link_queue_len();
 }
@@ -468,17 +626,59 @@ static const char *refusal(const char *line, printer_source_t source, char *buf,
     return gcode_refusal(&s.mo, max_mm, line, buf, len);
 }
 
+// s_mux held.
+static gcode_laser_cfg_t laser_cfg(void)
+{
+    return (gcode_laser_cfg_t){.fan = (int)s.cfg[PS_LASER_FAN], .s_max = s.cfg[PS_LASER_S_MAX],
+                               .cap = s.cfg[PS_LASER_CAP] / 100.0f};
+}
+
+static void laser_line_locked(char *buf, size_t len, int pwm)
+{
+    snprintf(buf, len, "M106 P%d S%d", (int)s.cfg[PS_LASER_FAN], pwm);
+}
+
+static void laser_off_line(char *buf, size_t len)
+{
+    xSemaphoreTake(s_mux, portMAX_DELAY);
+    laser_line_locked(buf, len, 0);
+    xSemaphoreGive(s_mux);
+}
+
 // The guard: false (and an "Error:bridge:" line to all clients) when the line must not go
-// out now. An allowed line is tracked (G90/G91, G92, moves).
-static bool allow(const char *line, printer_source_t source)
+// out now. An allowed line is tracked (G90/G91, G92, moves) and planned for the laser: *pre
+// gets a laser line to queue first ("" for none), *send false when the line itself isn't sent.
+static bool allow(const char *line, printer_source_t source, char *pre, size_t pre_len, bool *send)
 {
     char buf[PRINTER_STATE_WHY_MAX];
+    const char *why_note = NULL;
+    gcode_laser_step_t st;
+    pre[0] = '\0';
     xSemaphoreTake(s_mux, portMAX_DELAY);
     const char *why = refusal(line, source, buf, sizeof(buf));
     if (!why) {
+        gcode_laser_cfg_t lc = laser_cfg();
+        why = gcode_laser_plan(&s.laser, &lc, s.armed, line, &st);
+    }
+    if (!why) {
         track(line);
+        s.laser = st.next;
+        s.last_submit_us = esp_timer_get_time();
+        if (st.pre_pwm >= 0) {
+            laser_line_locked(pre, pre_len, st.pre_pwm);
+        }
+        *send = st.send;
+        if (!st.send && st.next.on) {  // M3/M4 or "S..": nothing goes out, so say what it did
+            gcode_laser_cfg_t lc = laser_cfg();
+            snprintf(buf, sizeof(buf), "echo:bridge: laser at S%g = %.0f %%: G1/G2/G3 moves fire it",
+                     (double)st.next.s, gcode_laser_pwm(&lc, st.next.s) * 100.0 / 255.0);
+            why_note = buf;
+        }
     }
     xSemaphoreGive(s_mux);
+    if (why_note) {
+        post_note(why_note);
+    }
     if (why) {
         ESP_LOGW(TAG, "refused \"%s\": %s", line, why);
         post_note(why);
@@ -516,16 +716,28 @@ int printer_state_submit(const char *line, printer_source_t source, TickType_t w
     if (ec) {
         return printer_emergency(line, source) == ESP_OK;
     }
+    xSemaphoreTake(s_submit, portMAX_DELAY);
     // Read before the guard: a STOP after this point makes the link drop the line.
     uint32_t epoch = printer_link_epoch();
-    if (!allow(line, source)) {
-        return 0;
-    }
-    if (printer_send_at(line, source, wait, epoch) != ESP_OK) {
+    char pre[24];
+    bool send = true;
+    int r = 1;
+    if (!allow(line, source, pre, sizeof(pre), &send)) {
+        r = 0;
+    } else if (pre[0] && printer_send_at(pre, source, wait, epoch) != ESP_OK) {
+        dropped(pre);  // also disarms: the laser may be in a state the bridge doesn't know
+        r = -1;
+    } else if (send && printer_send_at(line, source, wait, epoch) != ESP_OK) {
         dropped(line);
-        return -1;
+        r = -1;
     }
-    return 1;
+    xSemaphoreGive(s_submit);
+    return r;
+}
+
+int printer_state_line_cost(const char *line)
+{
+    return gcode_laser_cost(line);
 }
 
 // ---------------------------------------------------------------- homing without G28
@@ -787,7 +999,9 @@ static void home_task(void *arg)
 static esp_err_t home_start(const home_job_t *job, uint8_t axes, const char *note)
 {
     xSemaphoreTake(s_mux, portMAX_DELAY);
-    bool busy = s.homing || s.stopped || s.halted || printer_link_get_state() != PRINTER_LINK_UP;
+    bool armed = s.armed;  // a home's moves bypass the laser planning
+    bool busy = armed || s.homing || s.stopped || s.halted ||
+                printer_link_get_state() != PRINTER_LINK_UP;
     if (!busy) {
         s.homing = true;
         s.home_abort = false;
@@ -801,7 +1015,8 @@ static esp_err_t home_start(const home_job_t *job, uint8_t axes, const char *not
     }
     xSemaphoreGive(s_mux);
     if (busy) {
-        post_note("Error:bridge: homing not possible now (running, stopped, halted or no printer)");
+        post_note(armed ? "Error:bridge: disarm the laser before homing"
+                        : "Error:bridge: homing not possible now (running, stopped, halted or no printer)");
         return ESP_ERR_INVALID_STATE;
     }
     if (xTaskCreate(home_task, "home", 4096, (void *)job, 4, NULL) != pdPASS) {
@@ -830,9 +1045,15 @@ esp_err_t printer_state_home_z(void)
 // rest follows through the normal queue.
 esp_err_t printer_state_soft_stop(printer_source_t source)
 {
+    char laser_off[24];
     xSemaphoreTake(s_mux, portMAX_DELAY);
     s.stopped = true;
     s.home_abort = true;
+    // Enable pin off now; the laser-off line follows right after M410, below.
+    laser_drop_locked("echo:bridge: laser disarmed (STOP)", LASER_DROP_NONE);
+    s.laser.on = false;
+    s.laser.pwm = 0;
+    laser_line_locked(laser_off, sizeof(laser_off), 0);
     unhome();  // M410 can lose steps, and M84 drops the position anyway
     s.mo.relative = false;
     xSemaphoreGive(s_mux);
@@ -840,11 +1061,189 @@ esp_err_t printer_state_soft_stop(printer_source_t source)
 
     esp_err_t err = printer_emergency("M410", source);
     // G90 / M121: a home or jog stopped halfway may have left relative mode and endstops on.
-    static const char *const after[] = {"M104 S0", "M140 S0", "M107", "M84", "G90", "M121"};
+    const char *const after[] = {laser_off, "M104 S0", "M140 S0", "M107", "M84", "G90", "M121"};
     for (size_t i = 0; i < sizeof(after) / sizeof(after[0]) && err == ESP_OK; i++) {
         err = printer_send(after[i], source, pdMS_TO_TICKS(200));
     }
     return err;
+}
+
+// ---------------------------------------------------------------- laser
+
+const char *printer_state_laser_arm(void)
+{
+    const char *why = NULL;
+    xSemaphoreTake(s_mux, portMAX_DELAY);
+    if (s.armed) {
+        s.lease_until_us = esp_timer_get_time() + (int64_t)(s.cfg[PS_LASER_LEASE] * 1e6f);
+        xSemaphoreGive(s_mux);
+        return NULL;
+    }
+    if (s_pin_bad) {
+        why = "Error:bridge: laser not armed: its enable GPIO is not usable (see the log)";
+    } else if (s.drop_pending) {  // the last disarm's off line / STOP isn't out yet
+        why = "Error:bridge: laser not armed: still turning off, try again";
+    } else if (printer_link_get_state() != PRINTER_LINK_UP || s.halted) {
+        why = "Error:bridge: laser not armed: the printer isn't up";
+    } else if (s.stopped) {
+        why = "Error:bridge: laser not armed: stopped, press RESTART first";
+    } else if (s.homing) {
+        why = "Error:bridge: laser not armed: homing running";
+    } else if (!s.mo.ax[0].homed || !s.mo.ax[1].homed) {
+        why = "Error:bridge: laser not armed: home X Y first";
+    } else {
+        s.armed = true;
+        s.laser.on = false;  // M3 has to come after the arm
+        s.lease_until_us = esp_timer_get_time() + (int64_t)(s.cfg[PS_LASER_LEASE] * 1e6f);
+        s.last_submit_us = esp_timer_get_time();
+        laser_pin(true);
+    }
+    bool pin = s_pin_ok;
+    xSemaphoreGive(s_mux);
+    post_note(why ? why
+              : pin ? "echo:bridge: laser ARMED: M3 S<power> then G1 moves fire it"
+                    : "echo:bridge: laser ARMED (no enable pin: off waits for Marlin's queue)");
+    esp_event_post(PRINTER_STATE_EVENT, PRINTER_STATE_EVENT_CHANGED, NULL, 0, 0);
+    return why;
+}
+
+void printer_state_laser_alive(void)
+{
+    xSemaphoreTake(s_mux, portMAX_DELAY);
+    if (s.armed) {
+        s.lease_until_us = esp_timer_get_time() + (int64_t)(s.cfg[PS_LASER_LEASE] * 1e6f);
+    }
+    xSemaphoreGive(s_mux);
+}
+
+void printer_state_laser_disarm(void)
+{
+    xSemaphoreTake(s_mux, portMAX_DELAY);
+    laser_drop_locked("echo:bridge: laser disarmed", LASER_DROP_STOP);
+    xSemaphoreGive(s_mux);
+}
+
+// Queue a laser-off line (after M400 when wait_moves: off once the moves are done). A queue
+// that stays full means the laser state is unknown: soft STOP. s_submit held by the caller.
+static void laser_send_off(bool wait_moves)
+{
+    char off[24];
+    xSemaphoreTake(s_mux, portMAX_DELAY);
+    laser_line_locked(off, sizeof(off), 0);
+    s.laser.pwm = 0;
+    xSemaphoreGive(s_mux);
+    if ((wait_moves && printer_send("M400", PRINTER_SRC_INTERNAL, pdMS_TO_TICKS(500)) != ESP_OK) ||
+        printer_send(off, PRINTER_SRC_INTERNAL, pdMS_TO_TICKS(500)) != ESP_OK) {
+        printer_state_note("Error:bridge: laser-off line didn't fit in the queue: STOP");
+        printer_state_soft_stop(PRINTER_SRC_INTERNAL);
+    }
+}
+
+const char *printer_state_laser_test(void)
+{
+    const char *why = NULL;
+    char on[24], dwell[24], off[24];
+    float pct = 0;
+    int ms = 0;
+    xSemaphoreTake(s_submit, portMAX_DELAY);
+    uint32_t epoch = printer_link_epoch();
+    int64_t now = esp_timer_get_time();
+    xSemaphoreTake(s_mux, portMAX_DELAY);
+    bool busy = s.last_busy_us > 0 && now - s.last_busy_us <= BUSY_HOLD_US;
+    if (!s.armed) {
+        why = "Error:bridge: focus pulse: arm the laser first";
+    } else if (s.stopped || s.homing || s.halted) {
+        why = "Error:bridge: focus pulse not possible now";
+    } else if (printer_link_queue_len() > 0 || busy || s.laser.pwm > 0 || s.laser.on) {
+        why = "Error:bridge: focus pulse: wait until the head stands still, laser off (M5)";
+    } else if (printer_link_queue_free() < 4) {
+        why = "Error:bridge: focus pulse: queue busy, try again";
+    } else {
+        pct = fminf(s.cfg[PS_LASER_TEST], s.cfg[PS_LASER_CAP]);
+        ms = (int)s.cfg[PS_LASER_TEST_MS];
+        int pwm = (int)lroundf(pct / 100.0f * 255.0f);
+        laser_line_locked(on, sizeof(on), pwm < 1 ? 1 : pwm);
+        laser_line_locked(off, sizeof(off), 0);
+        snprintf(dwell, sizeof(dwell), "G4 P%d", ms);
+        s.laser.pwm = 0;  // where the pulse ends
+        s.last_submit_us = now;
+    }
+    xSemaphoreGive(s_mux);
+    if (!why) {
+        // M400: the moves are done before it fires. If the pulse can't be queued whole, STOP:
+        // its "on" may be in and its "off" not.
+        const char *lines[] = {"M400", on, dwell, off};
+        for (size_t i = 0; i < 4; i++) {
+            if (printer_send_at(lines[i], PRINTER_SRC_INTERNAL, pdMS_TO_TICKS(500), epoch) != ESP_OK) {
+                why = "Error:bridge: focus pulse didn't fit in the queue: STOP";
+                break;
+            }
+        }
+    }
+    xSemaphoreGive(s_submit);
+    if (why) {
+        post_note(why);
+        if (strstr(why, "STOP")) {
+            printer_state_soft_stop(PRINTER_SRC_INTERNAL);
+        }
+        return why;
+    }
+    char note[64];
+    snprintf(note, sizeof(note), "echo:bridge: laser focus pulse: %.1f %% for %d ms", (double)pct, ms);
+    post_note(note);
+    return NULL;
+}
+
+// Finishes disarms (note, then a STOP or a laser-off line), runs out the lease, and turns a
+// laser that is on but gets nothing new off once the moves are done.
+static void laser_task(void *arg)
+{
+    for (;;) {
+        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(200));
+        int64_t now = esp_timer_get_time();
+        xSemaphoreTake(s_mux, portMAX_DELAY);
+        if (s.armed && now > s.lease_until_us) {
+            laser_drop_locked("Error:bridge: laser disarmed: no keep-alive (page closed, hidden or "
+                              "offline)", LASER_DROP_STOP);
+        }
+        bool pending = s.drop_pending;
+        int mode = s.drop_mode;
+        const char *why = s.drop_why;
+        s.drop_pending = false;
+        s.drop_mode = LASER_DROP_NONE;
+        s.drop_why = NULL;
+        bool firing = s.laser.pwm > 0;
+        bool can_send = !s.halted && !s.stopped;  // a STOP sent the laser-off line itself
+        bool idle = !pending && s.armed && firing && now - s.last_submit_us > LASER_IDLE_OFF_US;
+        xSemaphoreGive(s_mux);
+
+        if (pending) {
+            if (why) {
+                post_note(why);
+            }
+            if (mode == LASER_DROP_STOP && can_send && (firing || printer_link_queue_len() > 0)) {
+                printer_state_soft_stop(PRINTER_SRC_INTERNAL);
+            } else if (mode != LASER_DROP_NONE && can_send) {
+                xSemaphoreTake(s_submit, portMAX_DELAY);
+                laser_send_off(false);
+                xSemaphoreGive(s_submit);
+            }
+            esp_event_post(PRINTER_STATE_EVENT, PRINTER_STATE_EVENT_CHANGED, NULL, 0, 0);
+        } else if (idle && printer_link_queue_len() == 0) {
+            xSemaphoreTake(s_submit, portMAX_DELAY);
+            // Again under s_submit: a line may have come in meanwhile.
+            xSemaphoreTake(s_mux, portMAX_DELAY);
+            idle = s.armed && s.laser.pwm > 0 &&
+                   esp_timer_get_time() - s.last_submit_us > LASER_IDLE_OFF_US;
+            xSemaphoreGive(s_mux);
+            if (idle && printer_link_queue_len() == 0) {
+                ESP_LOGI(TAG, "laser on with nothing queued: off after the moves");
+                laser_send_off(true);
+                esp_event_post(PRINTER_STATE_EVENT, PRINTER_STATE_EVENT_CHANGED, NULL, 0, 0);
+            }
+            xSemaphoreGive(s_submit);
+        }
+    }
 }
 
 void printer_state_restart(void)

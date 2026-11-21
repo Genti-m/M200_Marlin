@@ -25,7 +25,8 @@ controlled. This file grows one chapter at a time, as each step is done.
 - [x] 5. Review fixes: guard parsing, home abort, queue full
 - [x] 6. Setting tweaking: limits and homing / move tunables, saved on the bridge
 - [x] 7. Foundation: guard host tests, single-write UART lines, API token, OTA rollback, CI
-- [ ] 8. Laser safety and laser on/off / power control (kept up to date when the laser goes in)
+- [x] 8. Laser control in the bridge: arm, keep-alive, GRBL laser mode on a fan output, focus pulse
+- [ ] 8b. Laser hardware: module, supply voltage / current, wiring, enable pin, E-stop (open)
 - [x] 9. Review fixes 2: guard holes (`M 104`, `M104 I0`), nothing runs after a STOP
 - [x] 10. Web page: camera row above the console
 
@@ -188,21 +189,123 @@ then Build, **Flash** (USB, COM7). Then `!token <secret>` on the console. OTA fr
 curl -H "X-Token: <secret>" --data-binary @build/m200_bridge.bin http://m200.local/api/ota
 ```
 
-## 8. Laser safety (open: kept up to date when the laser goes in)
+## 8. Laser control (done, built, not flashed yet; the laser hardware is open, see 8b)
 
-Not started on purpose: nothing here is built yet. This chapter collects what has to be in
-place **before** the laser module is fitted, and is filled in step by step with that work.
+The bridge logic for a laser, built before the laser is chosen. The test module from a Meterk
+mini engraver (two wires, battery 3.7 V with USB 5 V through a diode-OR, about 3.8..4.7 V at the
+laser) is **not** the one that goes in: a proper module comes later. So nothing here depends
+on its voltage or current; those are open in 8b.
 
-- **Hardware interlock and E-stop** that cut the laser power directly, not through G-code.
-  Today STOP waits behind the running Marlin command (no `EMERGENCY_PARSER`), which is not
-  enough for a laser.
-- **Laser-off watchdog on the bridge**: laser off when the web / WebSocket client that runs
-  a job goes away, or the printer link stops answering.
-- **Off by default**: laser off at bridge boot, after a printer reset (`start`), on soft STOP
-  and on kill.
-- How the laser is switched (fan output / `M106`, a spare pin, or a separate driver input),
-  and which commands the bridge then lets through or refuses.
-- Enclosure, eye protection, fire watch.
+**How it is switched.** Stock Marlin has no laser feature and can't be rebuilt, so the laser
+hangs on a **Marlin fan output** (`M106 P<laser_fan>`), optionally behind an **enable pin** of
+the ESP32 (`CONFIG_LASER_ENABLE_GPIO`, menuconfig "Laser") in series. The enable pin is the
+bridge's own cut that doesn't wait for Marlin's queue; the timing comes from Marlin, and it is
+coarse (checked in Marlin bugfix-2.1.x source):
+
+- `M106` stores the speed, and every planner block made after it carries it, so the change
+  follows the move order. But the fan output is only written in a **10 Hz poll**
+  (`check_axes_activity()`, "limit to 10Hz"): a change lands **up to ~100 ms late**. At
+  1000 mm/min that is up to 1.7 mm of laser into the next `G0` travel, or missing at the start
+  of a `G1`. Segments shorter than the poll may get no power change at all.
+- So: outlines and marking at modest speed, yes. Raster / greyscale (power changing every
+  fraction of a mm), no. Sharp starts and ends need Marlin's `LASER_FEATURE` (a rebuilt Marlin,
+  over SWD) or a driver timed by the ESP itself.
+
+**GRBL laser mode** (what LaserGRBL / LightBurn write), turned into M106 by the bridge
+(`gcode_laser_plan()` in `gcode_guard`, host-tested):
+
+| Line | What the bridge sends |
+|---|---|
+| `M3 S500` / `M4 S500` | nothing, a note: the power for the next moves (`M4` = `M3`, no speed scaling in stock Marlin) |
+| `G1` / `G2` / `G3` `[S..]` | `M106 P0 S<pwm>` before the move when the power changes |
+| `G0`, `G4` | `M106 P0 S0` before it if the laser was on: travel and dwells don't fire (after the poll lag above) |
+| `M5` | `M106 P0 S0` |
+| `M106` on the laser's fan with power | refused: use `M3` / `M5` (`M106 S0`, `M107` pass) |
+
+PWM = S / `laser_s_max` x `laser_cap` x 255. Every line still passes the old guard first
+(heat, `G28`, the 0..max limits).
+
+**Arming and the keep-alive.** Laser G-code fires nothing until the laser is **armed**: Laser
+card on the page, Arm, tap again to confirm. It needs X and Y homed, the printer up, not
+stopped or homing. Armed, the page says "alive" every 0.7 s **while it is open and visible**;
+the bridge disarms after `laser_lease` (3 s) without one. Hidden tab, closed page, locked phone,
+WiFi gone: disarmed.
+
+**Off by default, and every way back to off:**
+
+| Event | Laser |
+|---|---|
+| bridge boot | enable pin driven off as soon as `printer_state` starts (about the first second after a reset; before that only the external pull-down holds it), `M106 P<fan> S0` to Marlin (it may still run from before) |
+| Disarm button, `!laser off`, `POST /api/laser {"arm":false}` | pin off; if it may be firing or lines are queued: soft STOP, else an off line |
+| keep-alive ran out | same as Disarm |
+| STOP | pin off, `M106 P<fan> S0` right after `M410` |
+| homes lost (`M84`, queue full), `M410` / `M108` typed | disarmed (STOP / off line) |
+| printer reset (`start`) | disarmed (Marlin boots with the fan off) |
+| Marlin kill | pin off. Marlin reads nothing more, and `kill()` / `minkill()` **don't zero the fans** (source); `minkill()` also turns interrupts off, so a software-PWM output freezes as it is, possibly fully on. **Only the pin or the E-stop cuts the laser then** |
+| printer stops answering | disarmed, soft STOP |
+| laser on, nothing new queued for 1 s | `M400` + off: off once the moves are done (GRBL: off when motion stops) |
+
+Also: settings can't change and homes can't start while armed; the page's jogs and presets are
+`G0` now (travel: the laser goes off before them). A laser line and its move go into the queue together, no other
+client's line between them.
+
+**Focus pulse**: armed, head standing still, `M5`: `M400`, `laser_test` % (2), `G4 P300`, off.
+On and off each land at Marlin's next 10 Hz poll, so the pulse is 300 ms give or take 100.
+
+**Settings** (group Laser in Setting tweaking): `laser_fan` 0, `laser_s_max` 1000,
+`laser_cap` 100 %, `laser_test` 2 %, `laser_test_ms` 300, `laser_lease` 3 s.
+
+**API**: WebSocket `laser_arm` / `laser_alive` / `laser_disarm` / `laser_test`,
+`POST /api/laser`, state field `laser` (`docs/protocol.md`). USB console: `!laser`, `!laser off`.
+
+Checked: host tests (new: PWM and cap, the GRBL mode line by line, refusals, queue cost), the
+firmware builds with no new warnings, and the whole flow against `tools/mock_bridge.py` (same
+rules): arm refused before homing, M3 only a note, `G1` gets `M106 P0 S128` before it, `G0`
+off first, `M106 S255` refused, settings refused while armed, idle off after 1 s, focus pulse
+lines, keep-alive timeout disarms, `M3` refused disarmed, STOP disarms. Page screenshotted
+desktop and 390 px. Not on the printer yet.
+
+### Review of ch. 8 (2026-11-21)
+
+Checked against Marlin's own source (bugfix-2.1.x `planner.cpp`, `MarlinCore.cpp`,
+`M106_M107.cpp`) and the ESP-IDF headers. Fixed:
+
+| Was | Now |
+|---|---|
+| The docs said Marlin applies a fan speed "with the planner block after it" | true for the order, but the output is written in a 10 Hz poll: up to ~100 ms late. Written down above, with what that rules out (raster) and how to measure it |
+| "Whether kill() stops the fans isn't known" | it doesn't: `kill()` / `minkill()` never zero the fans, and `minkill()` stops interrupts. The note on a kill says the output stays as it was |
+| Enable pin set up with `gpio_reset_pin()`, which turns the internal pull-up on: a moment toward "on" for an active-high driver | off level first, then `gpio_config()` with the internal pull toward off |
+| Only the UART pins were refused as enable pin | also USB 19/20 (the console), 26-37 (flash, octal PSRAM) and the strapping pins 0, 3, 45, 46 (a pull-down there changes the boot mode). Arming is refused with such a pin |
+| "Enable pin off before anything else" at boot | off once `printer_state` starts; before that only the external pull-down |
+| Arm right after a disarm: the disarm's STOP could still come and stop the new session | arming waits until the last disarm is finished ("still turning off, try again") |
+| Mock: after a fake kill + restart the laser PWM stayed at its old value | reset at `start`, like the firmware |
+
+Confirmed as written: `M106` without `S` is full speed (255), an unknown `P` is ignored, `M106`
+never calls `planner.synchronize()`.
+
+### 8b. Laser hardware (open)
+
+To decide when the real module is there:
+
+- **Module and its supply**: voltage and current (a TTL/PWM driver input, or two wires switched
+  on the supply). Never the printer's 24 V on a 5 V module. Its own supply (buck) or a big
+  capacitor, so the laser's current steps don't reset the ESP32.
+- **Which fan output**, and how Marlin drives it, measured with an LED before the laser:
+  which `P` index responds, 24 V on + with only − switched (then laser + from its own supply,
+  − to the fan −, grounds joined), the PWM frequency, and `FAN_MIN_PWM` / `FAN_KICKSTART` (a
+  kick-start would fire full power for a moment). Measure the lag of the 10 Hz poll: an LED on
+  the output, `G1 X50 F1000 / M106 S255 / G1 X100 / M106 S0 / G0 X150`, filmed: how far into
+  the `G0` it stays lit. Whether the build has `LASER_SYNCHRONOUS_M106_M107` (unlikely without
+  `LASER_FEATURE`) can't be read from outside.
+- **Enable pin**: a free ESP32-S3 GPIO (the firmware refuses 0, 3, 17-20, 26-37, 45, 46), a
+  logic-level MOSFET (AO3400 / IRLZ44N, not IRF520), a pull-down so it is off while the ESP
+  boots. Then `CONFIG_LASER_ENABLE_GPIO`.
+- **E-stop / key switch** in the laser supply, not through G-code (STOP still waits behind the
+  running Marlin command: no `EMERGENCY_PARSER`).
+- **Long moves**: the idle-off sends `M400`; if Marlin sends no `busy:` while it waits, a move
+  longer than the 15 s `ok` timeout reads as "printer stopped answering" and STOPs.
+- Enclosure, goggles for the wavelength, sacrificial board over the bed, smoke extraction,
+  never unattended.
 
 
 ## 9. Review fixes 2 (done, built, not flashed yet)

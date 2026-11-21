@@ -72,7 +72,7 @@ static void scan_command(void)
 }
 
 // "!wifi <ssid> <password>" (ssid in "quotes" if it has spaces), "!wifi clear", "!net", "!scan",
-// "!token [<secret>|clear]", "!reboot", "!homexy", "!homez", "!help"
+// "!token [<secret>|clear]", "!reboot", "!homexy", "!homez", "!laser [off]", "!help"
 static void bridge_command(const char *cmd)
 {
     if (strcmp(cmd, "wifi clear") == 0) {
@@ -156,6 +156,14 @@ static void bridge_command(const char *cmd)
         printer_state_home_xy();  // progress and result come as "bridge:" lines
     } else if (strcmp(cmd, "homez") == 0) {
         printer_state_home_z();
+    } else if (strcmp(cmd, "laser") == 0) {
+        printer_state_t st;
+        printer_state_get(&st);
+        printf("laser %s, %s, PWM %d/255, enable pin %s\n", st.laser_armed ? "ARMED" : "disarmed",
+               st.laser_on ? "M3 on" : "M5", st.laser_pwm,
+               st.laser_pin ? "configured" : "none (Kconfig LASER_ENABLE_GPIO)");
+    } else if (strcmp(cmd, "laser off") == 0) {
+        printer_state_laser_disarm();  // arming is the page's: it keeps the lease alive
     } else {
         printf("bridge commands:\n"
                "  !wifi <ssid> <password>   save WiFi in NVS and connect\n"
@@ -167,6 +175,7 @@ static void bridge_command(const char *cmd)
                "  !reboot                   restart the ESP32\n"
                "  !homexy                   home X Y on their endstops, park at 10 (no G28)\n"
                "  !homez                    home Z on the switch (steps + M119), park at 10\n"
+               "  !laser / !laser off       laser status / disarm (arm it on the web page)\n"
                "anything else goes to the printer as G-code\n");
     }
 }
